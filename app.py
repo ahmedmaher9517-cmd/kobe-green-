@@ -64,7 +64,13 @@ if 'logged_in' not in st.session_state:
 def get_conn():
     """Smart connection - SQLite for local dev, PostgreSQL for cloud"""
     if IS_DEPLOYED:
-        return psycopg2.connect(SUPABASE_DB_URL)
+        try:
+            return psycopg2.connect(SUPABASE_DB_URL)
+        except Exception as e:
+            # Show actual error for debugging
+            st.error(f"⚠️ Supabase connection failed: {str(e)}")
+            st.warning("Falling back to SQLite (data won't persist on cloud)")
+            return sqlite3.connect(DB_NAME, check_same_thread=False)
     else:
         return sqlite3.connect(DB_NAME, check_same_thread=False)
 
