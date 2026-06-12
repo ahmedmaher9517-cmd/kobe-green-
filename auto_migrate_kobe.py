@@ -208,7 +208,7 @@ def migrate_supabase_kobe(connection_url):
         
         cur.execute(SCHEMA)
         
-        -- Insert default data if empty
+        # Insert default data if empty
         cur.execute("SELECT COUNT(*) FROM settings")
         if cur.fetchone()[0] == 0:
             cur.execute(
