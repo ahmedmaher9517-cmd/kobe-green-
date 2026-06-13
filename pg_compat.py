@@ -94,7 +94,7 @@ _pools = {}
 
 def connect(dsn, **kwargs):
     if dsn not in _pools:
-        _pools[dsn] = pool.ThreadedConnectionPool(1, 6, dsn, **kwargs)
+        _pools[dsn] = pool.ThreadedConnectionPool(2, 12, dsn, **kwargs)
     raw = _pools[dsn].getconn()
     return PgConnection(raw, _pools[dsn])
 
