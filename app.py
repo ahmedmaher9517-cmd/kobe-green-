@@ -126,7 +126,7 @@ def get_conn():
     """PostgreSQL on Supabase when configured, otherwise local SQLite."""
     if USE_SUPABASE:
         try:
-            return pg_connect(SUPABASE_DB_URL, connect_timeout=10)
+            return pg_connect(SUPABASE_DB_URL, connect_timeout=5)
         except Exception as e:
             st.error(f"⚠️ Supabase connection failed: {str(e)}")
             st.stop()
@@ -220,7 +220,7 @@ except Exception as e:
     st.error(f"⚠️ خطأ في قاعدة البيانات: {e}")
     st.stop()
 
-if USE_SUPABASE:
+if USE_SUPABASE and "_db_ok" not in st.session_state:
     try:
         with get_conn() as conn:
             conn.execute("SELECT 1")
@@ -232,14 +232,45 @@ if USE_SUPABASE:
 # ==========================================
 # 1. الدوال المساعدة وتصميم الـ HTML
 # ==========================================
-def get_settings():
-    with get_conn() as conn: row = conn.execute("SELECT company_name, phone, address, gemini_key FROM settings WHERE id=1").fetchone()
-    if row: return {"company_name": row[0] or DEFAULT_COMPANY, "phone": row[1] or "", "address": row[2] or "", "gemini_key": row[3] or ""}
+@st.cache_data(ttl=60, show_spinner=False)
+def _load_settings():
+    with get_conn() as conn:
+        row = conn.execute("SELECT company_name, phone, address, gemini_key FROM settings WHERE id=1").fetchone()
+    if row:
+        return {
+            "company_name": row[0] or DEFAULT_COMPANY,
+            "phone": row[1] or "",
+            "address": row[2] or "",
+            "gemini_key": row[3] or "",
+        }
     return {"company_name": DEFAULT_COMPANY, "phone": "", "address": "", "gemini_key": ""}
 
-def get_banks():
-    with get_conn() as conn: rows = conn.execute("SELECT name FROM banks ORDER BY name").fetchall()
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _load_banks():
+    with get_conn() as conn:
+        rows = conn.execute("SELECT name FROM banks ORDER BY name").fetchall()
     return [r[0] for r in rows] if rows else ["بنك افتراضي"]
+
+
+def get_settings():
+    return _load_settings()
+
+
+def get_banks():
+    return _load_banks()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _load_customers_df():
+    with get_conn() as conn:
+        return sql_df("SELECT name, pricing_tier, credit_limit FROM customers", conn)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _load_inv_df():
+    with get_conn() as conn:
+        return sql_df("SELECT name, type, qty, sell_price, wholesale_price, dist_price FROM inv", conn)
 
 def plotly_layout():
     return dict(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(family="Cairo", color="#e8d5b5"), legend=dict(font=dict(color="#e8d5b5")), xaxis=dict(gridcolor="rgba(193,155,98,0.15)", tickfont=dict(color="#e8d5b5")), yaxis=dict(gridcolor="rgba(193,155,98,0.15)", tickfont=dict(color="#e8d5b5")))
@@ -446,25 +477,8 @@ if not st.session_state.logged_in:
     st.info("💡 للدخول إلى نظام كوبي جرين ERP، يرجى إدخال بيانات الدخول الخاصة بك")
     st.stop()
 
-# ==========================================
-# Welcome Dashboard (shown after login)
-# ==========================================
-st.markdown(f'<div class="main-header">{load_logo_html()}<br><h2>🎉 مرحباً بك في نظام كوبي جرين ERP</h2></div>', unsafe_allow_html=True)
-
-# Display user info
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.info(f"👤 **المستخدم:** {st.session_state.username}")
-with col2:
-    st.info(f"🎭 **الصلاحية:** {st.session_state.role}")
-with col3:
-    if st.session_state.company_id:
-        st.info(f"🏢 **الشركة:** {st.session_state.company_id}")
-
-st.markdown("---")
-
 cfg = get_settings()
-st.sidebar.markdown(f"👤 **{st.session_state.username}**")
+st.sidebar.markdown(f"👤 **{st.session_state.username}** | {st.session_state.role}")
 if USE_SUPABASE:
     st.sidebar.success("🟢 Supabase — بيانات دائمة")
 else:
@@ -513,9 +527,8 @@ elif choice == "🛒 المبيعات والمشتريات":
     t_sale, t_buy, t_ret = st.tabs(["🛒 نقطة البيع (إصدار فاتورة)", "📥 إدخال مشتريات للمخزن", "🔙 المرتجعات"])
     
     with t_sale:
-        with get_conn() as conn:
-            c_df = sql_df("SELECT name, pricing_tier, credit_limit FROM customers", conn)
-            items = sql_df("SELECT name, type, qty, sell_price, wholesale_price, dist_price FROM inv", conn)
+        c_df = _load_customers_df()
+        items = _load_inv_df()
         
         cl, cr = st.columns([1, 1.2])
         with cl:
@@ -566,6 +579,8 @@ elif choice == "🛒 المبيعات والمشتريات":
                             conn.execute("UPDATE inv SET qty=qty-? WHERE name=? AND type=?", (ln["qty"], ln["item"], ln["type"]))
                         insert_treasury(conn, "إيداع", "مبيعات", f"فاتورة {inv_no}", paid, pm, bank_ch)
                         conn.commit()
+                    _load_inv_df.clear()
+                    _load_customers_df.clear()
                     st.session_state.inv_res = {"no": inv_no, "d": d, "c": cf, "cart": list(st.session_state.cart), "gross": gross, "disc": disc, "net": net, "paid": paid, "rem": net-paid, "pay": pm}
                     st.session_state.cart = []; st.rerun()
 
@@ -1083,7 +1098,9 @@ elif choice == "🛠️ الإعدادات والتعديل اليدوي":
             gk = st.text_input("Gemini API Key (مفتاح الذكاء الاصطناعي)", sc.get("gemini_key", ""), type="password")
             if st.button("💾 حفظ الإعدادات الأساسية"):
                 conn.execute("UPDATE settings SET company_name=?,phone=?,address=?,gemini_key=? WHERE id=1", (cn, ph, ad, gk))
-                conn.commit(); st.success("تم الحفظ!"); st.rerun()
+                conn.commit()
+                _load_settings.clear()
+                st.success("تم الحفظ!"); st.rerun()
         with t2:
             st.info("حدد أسعار القطاعي، الجملة، والموزعين لكل صنف بدقة.")
             ed_i = st.data_editor(sql_df("SELECT id, name, type, qty, sell_price, wholesale_price, dist_price FROM inv", conn), disabled=["id", "name", "type", "qty"], use_container_width=True)
