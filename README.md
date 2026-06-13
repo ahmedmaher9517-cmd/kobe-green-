@@ -26,10 +26,6 @@ streamlit run app.py
 SUPABASE_DB_URL = "postgresql://..."
 ```
 
-## Login
-- Username: `admin`
-- Password: `123`
-
 ## Tech Stack
 - Streamlit
 - Supabase (PostgreSQL)
