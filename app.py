@@ -13,7 +13,12 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-# محاولة استدعاء Plotly 
+try:
+    st.set_page_config(page_title="KOBE GREEN ERP", page_icon="☕", layout="wide", initial_sidebar_state="expanded")
+except Exception:
+    pass
+
+# محاولة استدعاء Plotly
 try:
     import plotly.express as px
     import plotly.graph_objects as go
@@ -22,25 +27,73 @@ except ImportError:
     PLOTLY_AVAILABLE = False
 
 # ==========================================
-# 🌐 Supabase Cloud Database Support
+# 🌐 Supabase PostgreSQL (Kobe Green ERP)
 # ==========================================
-IS_DEPLOYED = False
+USE_SUPABASE = False
 SUPABASE_DB_URL = None
 
+
+def _load_env_file():
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(env_path):
+        return
+    with open(env_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip())
+
+
+_load_env_file()
+
 try:
-    if hasattr(st, 'secrets') and 'SUPABASE_DB_URL' in st.secrets:
-        SUPABASE_DB_URL = st.secrets['SUPABASE_DB_URL']
-        IS_DEPLOYED = True
-        try:
-            import psycopg2
-            import psycopg2.extras
-        except ImportError:
-            st.error("❌ Database driver missing. Contact administrator.")
-            st.stop()
+    if hasattr(st, "secrets") and "supabase" in st.secrets and "SUPABASE_DB_URL" in st.secrets["supabase"]:
+        SUPABASE_DB_URL = st.secrets["supabase"]["SUPABASE_DB_URL"]
+    elif hasattr(st, "secrets") and "SUPABASE_DB_URL" in st.secrets:
+        SUPABASE_DB_URL = st.secrets["SUPABASE_DB_URL"]
 except Exception:
     pass
 
-st.set_page_config(page_title="KOBE GREEN ERP", page_icon="☕", layout="wide", initial_sidebar_state="expanded")
+if not SUPABASE_DB_URL:
+    SUPABASE_DB_URL = os.environ.get("SUPABASE_DB_URL")
+
+def _is_streamlit_cloud():
+    return os.path.isdir("/mount/src") or os.environ.get("STREAMLIT_RUNTIME_ENV") == "cloud"
+
+
+# Supabase دائماً — محلي وسيرفر (نفس إعداد secrets.toml)
+# SQLite فقط للطوارئ: ضع ALLOW_LOCAL_SQLITE=1 في البيئة
+ALLOW_SQLITE_FALLBACK = os.environ.get("ALLOW_LOCAL_SQLITE") == "1"
+USE_SUPABASE = bool(SUPABASE_DB_URL)
+
+if not USE_SUPABASE and not ALLOW_SQLITE_FALLBACK:
+    where = "Streamlit Cloud → Settings → Secrets" if _is_streamlit_cloud() else ".streamlit/secrets.toml أو .env"
+    st.error(
+        f"❌ **Kobe Green يعمل على Supabase فقط.**\n\n"
+        f"أضف `SUPABASE_DB_URL` في: **{where}**\n\n"
+        f"انسخ المحتوى من ملف `STREAMLIT_SECRETS.txt` ثم Reboot.\n\n"
+        f"بدون Supabase لن تُحفظ البيانات."
+    )
+    st.stop()
+
+if _is_streamlit_cloud() and not USE_SUPABASE:
+    st.error(
+        "❌ **السيرفر غير مربوط بـ Supabase!**\n\n"
+        "Streamlit Cloud → Settings → Secrets → الصق من `STREAMLIT_SECRETS.txt` → Save → Reboot."
+    )
+    st.stop()
+
+if USE_SUPABASE:
+    try:
+        import psycopg2
+        import psycopg2.extras
+        from pg_compat import connect as pg_connect
+        from pg_compat import read_sql_query as pg_read_sql_query
+    except ImportError:
+        st.error("❌ psycopg2-binary is required for Supabase. Run: pip install psycopg2-binary")
+        st.stop()
 
 DB_NAME = os.environ.get("KOBE_DB_PATH", "kobecup_master_erp_v7.db")
 DEFAULT_COMPANY = "كوبي جرين | KOBE GREEN"
@@ -58,38 +111,77 @@ if 'logged_in' not in st.session_state:
     st.session_state['logged_in'] = False
     st.session_state['role'] = None
     st.session_state['username'] = None
+    st.session_state['company_id'] = None
+    st.session_state['user'] = None
     st.session_state['cart'] = []
     st.session_state['kc_cart'] = []
 
+def sql_df(query, conn, params=None):
+    if USE_SUPABASE:
+        return pg_read_sql_query(query, conn, params)
+    return pd.read_sql_query(query, conn, params=params)
+
+
 def get_conn():
-    """Smart connection - SQLite for local dev, PostgreSQL for cloud"""
-    if IS_DEPLOYED:
+    """PostgreSQL on Supabase when configured, otherwise local SQLite."""
+    if USE_SUPABASE:
         try:
-            return psycopg2.connect(SUPABASE_DB_URL)
+            return pg_connect(SUPABASE_DB_URL, connect_timeout=10)
         except Exception as e:
-            # Show actual error for debugging
             st.error(f"⚠️ Supabase connection failed: {str(e)}")
-            st.warning("Falling back to SQLite (data won't persist on cloud)")
-            return sqlite3.connect(DB_NAME, check_same_thread=False)
-    else:
-        return sqlite3.connect(DB_NAME, check_same_thread=False)
+            st.stop()
+    return sqlite3.connect(DB_NAME, check_same_thread=False)
+
+def authenticate_user(username, password):
+    """
+    Secure login function that checks username and password against the users table.
+    Returns: (success: bool, user_data: dict or None, error_message: str)
+    """
+    try:
+        with get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT username, role, company_id FROM users WHERE username = ? AND password = ?",
+                (username.strip(), password),
+            )
+            row = cur.fetchone()
+
+            if row:
+                user_data = {
+                    "username": row[0],
+                    "role": row[1],
+                    "company_id": row[2] if len(row) > 2 else None,
+                }
+                return True, user_data, None
+            return False, None, "Invalid username or password"
+                
+    except Exception as e:
+        return False, None, f"Database error: {str(e)}"
 
 def migrate_schema():
-    if IS_DEPLOYED:
-        # Auto-migrate Supabase on first cloud run
-        try:
-            from auto_migrate_kobe import migrate_supabase_kobe
-            migrate_supabase_kobe(SUPABASE_DB_URL)
-        except Exception as e:
-            st.error(f"Database setup: {e}")
+    if USE_SUPABASE:
         return
-    
+
     with get_conn() as conn:
-        c = conn.cursor()
-        c.execute("CREATE TABLE IF NOT EXISTS todos (id INTEGER PRIMARY KEY AUTOINCREMENT, task TEXT, is_done INTEGER DEFAULT 0, created_at TEXT)")
-        conn.commit()
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(leads)").fetchall()]
+        if cols and "source" not in cols:
+            conn.execute("ALTER TABLE leads ADD COLUMN source TEXT")
+            conn.commit()
+
+
+@st.cache_resource
+def _ensure_supabase_schema(db_url):
+    """Run once per server — not on every Streamlit rerun."""
+    from auto_migrate_kobe import migrate_supabase_kobe
+    migrate_supabase_kobe(db_url)
+    return True
+
 
 def init_db():
+    if USE_SUPABASE:
+        _ensure_supabase_schema(SUPABASE_DB_URL)
+        return
+
     with get_conn() as conn:
         c = conn.cursor()
         c.execute("CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, company_name TEXT, phone TEXT, address TEXT, gemini_key TEXT DEFAULT '')")
@@ -122,7 +214,20 @@ def init_db():
         conn.commit()
     migrate_schema()
 
-init_db()
+try:
+    init_db()
+except Exception as e:
+    st.error(f"⚠️ خطأ في قاعدة البيانات: {e}")
+    st.stop()
+
+if USE_SUPABASE:
+    try:
+        with get_conn() as conn:
+            conn.execute("SELECT 1")
+        st.session_state["_db_ok"] = True
+    except Exception as e:
+        st.error(f"❌ فشل الاتصال بـ Supabase: {e}")
+        st.stop()
 
 # ==========================================
 # 1. الدوال المساعدة وتصميم الـ HTML
@@ -219,12 +324,12 @@ def ai_copilot_parser(cmd, api_key=""):
     msg = "🤖 لم أفهم الأمر."
     if api_key:
         try:
-            items_df = pd.read_sql_query("SELECT name, type, qty, sell_price FROM inv", conn)
-            cust_df = pd.read_sql_query("SELECT name FROM customers", conn)
-            df_t = pd.read_sql_query("SELECT movement_type, amount FROM treasury", conn)
+            items_df = sql_df("SELECT name, type, qty, sell_price FROM inv", conn)
+            cust_df = sql_df("SELECT name FROM customers", conn)
+            df_t = sql_df("SELECT movement_type, amount FROM treasury", conn)
             cash_balance = df_t[df_t['movement_type']=='إيداع']['amount'].sum() - df_t[df_t['movement_type']=='سحب']['amount'].sum() if not df_t.empty else 0
-            low_stock = pd.read_sql_query("SELECT name, qty FROM inv WHERE qty<=10", conn).to_dict('records')
-            pending_crm = pd.read_sql_query("SELECT name, status FROM leads WHERE status NOT LIKE '%مغلق%'", conn).to_dict('records')
+            low_stock = sql_df("SELECT name, qty FROM inv WHERE qty<=10", conn).to_dict('records')
+            pending_crm = sql_df("SELECT name, status FROM leads WHERE status NOT LIKE '%مغلق%'", conn).to_dict('records')
             
             prompt = f"""أنت مساعد مدير مالي وتسويق لنظام Kobe Green.
             حالة النظام الآن للتحليل:
@@ -269,7 +374,7 @@ def ai_copilot_parser(cmd, api_key=""):
     try:
         if "بيع" in cmd_cl and len(nums) >= 2:
             qty, price = float(nums[0]), float(nums[1])
-            items = pd.read_sql_query("SELECT name, type FROM inv", conn)
+            items = sql_df("SELECT name, type FROM inv", conn)
             found = next((r for _, r in items.iterrows() if r['name'].split()[0].lower() in cmd_cl), None)
             if found is not None:
                 total = qty * price
@@ -280,7 +385,7 @@ def ai_copilot_parser(cmd, api_key=""):
                 msg = f"✅ تم تسجيل بيع {qty} {found['name']} بإجمالي {total:,.2f} ج.م."
         elif "سداد" in cmd_cl and len(nums) >= 1:
             amt = float(nums[0])
-            custs = pd.read_sql_query("SELECT name FROM customers", conn)
+            custs = sql_df("SELECT name FROM customers", conn)
             found_c = next((r['name'] for _, r in custs.iterrows() if r['name'].split()[0].lower() in cmd_cl), None)
             if found_c:
                 cur.execute("INSERT INTO sales (date, time, inv_no, client, item, type, qty, unit_p, total, paid, discount, is_return, pay_method, shipping_method) VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?,'---')", (now_dt()[0], now_dt()[1], f"AI-REC-{datetime.now().strftime('%M%S')}", found_c, "سداد دفعة (AI)", "-", 0, 0, 0, amt, 0, "كاش"))
@@ -314,15 +419,56 @@ if not st.session_state.logged_in:
     with mid:
         st.markdown(f'<div class="main-header">{load_logo_html()}<br><h2>تسجيل الدخول</h2></div>', unsafe_allow_html=True)
         with st.form("login"):
-            u, p = st.text_input("اسم المستخدم"), st.text_input("كلمة المرور", type="password")
+            u = st.text_input("اسم المستخدم", placeholder="أدخل اسم المستخدم")
+            p = st.text_input("كلمة المرور", type="password", placeholder="أدخل كلمة المرور")
+            
             if st.form_submit_button("دخول", use_container_width=True):
-                with get_conn() as conn: row = conn.execute("SELECT role FROM users WHERE username=? AND password=?", (u.strip(), p)).fetchone()
-                if row: st.session_state.logged_in, st.session_state.role, st.session_state.username = True, row[0], u.strip(); st.rerun()
-                st.error("بيانات خاطئة")
+                if not u.strip() or not p:
+                    st.error("⚠️ يرجى إدخال اسم المستخدم وكلمة المرور")
+                else:
+                    # Authenticate user
+                    success, user_data, error_msg = authenticate_user(u, p)
+                    
+                    if success:
+                        # Save user info in session state
+                        st.session_state.logged_in = True
+                        st.session_state.username = user_data['username']
+                        st.session_state.role = user_data['role']
+                        st.session_state.company_id = user_data.get('company_id')
+                        st.session_state.user = user_data
+                        
+                        st.success(f"✅ مرحباً {user_data['username']}!")
+                        st.rerun()
+                    else:
+                        st.error(f"❌ {error_msg}")
+    
+    # Show welcome message or instructions
+    st.info("💡 للدخول إلى نظام كوبي جرين ERP، يرجى إدخال بيانات الدخول الخاصة بك")
     st.stop()
+
+# ==========================================
+# Welcome Dashboard (shown after login)
+# ==========================================
+st.markdown(f'<div class="main-header">{load_logo_html()}<br><h2>🎉 مرحباً بك في نظام كوبي جرين ERP</h2></div>', unsafe_allow_html=True)
+
+# Display user info
+col1, col2, col3 = st.columns(3)
+with col1:
+    st.info(f"👤 **المستخدم:** {st.session_state.username}")
+with col2:
+    st.info(f"🎭 **الصلاحية:** {st.session_state.role}")
+with col3:
+    if st.session_state.company_id:
+        st.info(f"🏢 **الشركة:** {st.session_state.company_id}")
+
+st.markdown("---")
 
 cfg = get_settings()
 st.sidebar.markdown(f"👤 **{st.session_state.username}**")
+if USE_SUPABASE:
+    st.sidebar.success("🟢 Supabase — بيانات دائمة")
+else:
+    st.sidebar.error("🔴 SQLite — للتجربة فقط")
 if st.sidebar.button("🚪 تسجيل الخروج", key="btn_logout_master"): st.session_state.logged_in = False; st.rerun()
 st.sidebar.markdown("---")
 
@@ -354,7 +500,7 @@ if choice == "🏠 الرئيسية (الداشبورد)":
         s_today = conn.execute("SELECT SUM(total) FROM sales WHERE date=? AND is_return=0", (now_dt()[0],)).fetchone()[0] or 0
         c_in = conn.execute("SELECT SUM(amount) FROM treasury WHERE movement_type='إيداع'").fetchone()[0] or 0
         c_out = conn.execute("SELECT SUM(amount) FROM treasury WHERE movement_type='سحب'").fetchone()[0] or 0
-        inv_val = pd.read_sql_query("SELECT SUM(qty * buy_price) FROM inv", conn).iloc[0,0] or 0
+        inv_val = sql_df("SELECT SUM(qty * buy_price) FROM inv", conn).iloc[0,0] or 0
         
         c1, c2, c3, c4 = st.columns(4)
         lux_box(c1, "مبيعات اليوم", f"{s_today:,.2f} ج.م")
@@ -368,8 +514,8 @@ elif choice == "🛒 المبيعات والمشتريات":
     
     with t_sale:
         with get_conn() as conn:
-            c_df = pd.read_sql_query("SELECT name, pricing_tier, credit_limit FROM customers", conn)
-            items = pd.read_sql_query("SELECT name, type, qty, sell_price, wholesale_price, dist_price FROM inv", conn)
+            c_df = sql_df("SELECT name, pricing_tier, credit_limit FROM customers", conn)
+            items = sql_df("SELECT name, type, qty, sell_price, wholesale_price, dist_price FROM inv", conn)
         
         cl, cr = st.columns([1, 1.2])
         with cl:
@@ -449,8 +595,8 @@ elif choice == "🛒 المبيعات والمشتريات":
     with t_ret:
         st.markdown("### 🔙 تسجيل مرتجع من عميل")
         with get_conn() as conn:
-            c_df = pd.read_sql_query("SELECT name FROM customers", conn)
-            items = pd.read_sql_query("SELECT name, type FROM inv", conn)
+            c_df = sql_df("SELECT name FROM customers", conn)
+            items = sql_df("SELECT name, type FROM inv", conn)
         
         c_ret = st.selectbox("العميل (المرتجع):", ["عميل نقدي"] + c_df['name'].tolist(), key="ret_client")
         if not items.empty:
@@ -481,19 +627,19 @@ elif choice == "📦 إدارة المخزون":
         t_stock, t_sales_track, t_purch_track = st.tabs(["📊 حالة المخزون الحالية", "📤 حركة المبيعات المنصرفة", "📥 حركة المشتريات الواردة"])
         
         with t_stock:
-            df = pd.read_sql_query("SELECT name الصنف, type النوع, qty الكمية, buy_price 'تكلفة الشراء', sell_price 'سعر البيع' FROM inv ORDER BY type", conn)
+            df = sql_df("SELECT name الصنف, type النوع, qty الكمية, buy_price 'تكلفة الشراء', sell_price 'سعر البيع' FROM inv ORDER BY type", conn)
             if not df.empty:
                 st.warning(f"إجمالي قيمة المخزون الحالية (بالتكلفة): **{(df['الكمية'] * df['تكلفة الشراء']).sum():,.2f} ج.م**")
                 st.dataframe(df, use_container_width=True)
                 
         with t_sales_track:
             st.markdown("#### 📤 سجل البضاعة المباعة (المنصرف)")
-            df_s = pd.read_sql_query("SELECT date 'التاريخ', time 'الوقت', inv_no 'رقم الفاتورة', client 'العميل', item 'الصنف', type 'النوع', qty 'الكمية', total 'الإجمالي' FROM sales WHERE is_return=0 AND item!='سداد دفعة نقدية' ORDER BY id DESC LIMIT 200", conn)
+            df_s = sql_df("SELECT date 'التاريخ', time 'الوقت', inv_no 'رقم الفاتورة', client 'العميل', item 'الصنف', type 'النوع', qty 'الكمية', total 'الإجمالي' FROM sales WHERE is_return=0 AND item!='سداد دفعة نقدية' ORDER BY id DESC LIMIT 200", conn)
             st.dataframe(df_s, use_container_width=True)
             
         with t_purch_track:
             st.markdown("#### 📥 سجل البضاعة المشتراة (الوارد)")
-            df_p = pd.read_sql_query("SELECT date 'التاريخ', time 'الوقت', supplier 'المورد', item 'الصنف', type 'النوع', qty 'الكمية', total 'الإجمالي' FROM purchases WHERE item!='سداد دفعة نقدية' AND supplier!='نقل داخلي لكوبي كاب' ORDER BY id DESC LIMIT 200", conn)
+            df_p = sql_df("SELECT date 'التاريخ', time 'الوقت', supplier 'المورد', item 'الصنف', type 'النوع', qty 'الكمية', total 'الإجمالي' FROM purchases WHERE item!='سداد دفعة نقدية' AND supplier!='نقل داخلي لكوبي كاب' ORDER BY id DESC LIMIT 200", conn)
             st.dataframe(df_p, use_container_width=True)
 
 elif choice == "🏦 الخزينة واليومية":
@@ -501,7 +647,7 @@ elif choice == "🏦 الخزينة واليومية":
     t_trs, t_day = st.tabs(["💰 أرصدة الخزينة والبنوك", "📓 دفتر حركات اليوم"])
     with get_conn() as conn:
         with t_trs:
-            df_t = pd.read_sql_query("SELECT movement_type, pay_method, method_details, amount FROM treasury", conn)
+            df_t = sql_df("SELECT movement_type, pay_method, method_details, amount FROM treasury", conn)
             
             c_in = df_t[(df_t.movement_type=='إيداع') & (df_t.pay_method=='كاش')].amount.sum() - df_t[(df_t.movement_type=='سحب') & (df_t.pay_method=='كاش')].amount.sum() if not df_t.empty else 0
             
@@ -539,7 +685,7 @@ elif choice == "🏦 الخزينة واليومية":
                     conn.commit(); st.rerun()
             
             with tr2:
-                custs = pd.read_sql_query("SELECT name FROM customers", conn)['name'].tolist()
+                custs = sql_df("SELECT name FROM customers", conn)['name'].tolist()
                 if custs:
                     sel_c = st.selectbox("العميل", custs, key="tr_c")
                     amt_c = st.number_input("المبلغ المحصل", 0.01, key="tr_amt_c")
@@ -551,7 +697,7 @@ elif choice == "🏦 الخزينة واليومية":
                         conn.commit(); st.success("تم التحصيل بنجاح!"); st.rerun()
             
             with tr3:
-                supps = pd.read_sql_query("SELECT name FROM suppliers", conn)['name'].tolist()
+                supps = sql_df("SELECT name FROM suppliers", conn)['name'].tolist()
                 if supps:
                     sel_s = st.selectbox("المورد", supps, key="tr_s")
                     amt_s = st.number_input("المبلغ المسدد", 0.01, key="tr_amt_s")
@@ -562,14 +708,14 @@ elif choice == "🏦 الخزينة واليومية":
                         insert_treasury(conn, "سحب", "سداد ديون", f"سداد لـ {sel_s}", amt_s, pm_s, det_s)
                         conn.commit(); st.success("تم السداد بنجاح!"); st.rerun()
             
-            st.dataframe(pd.read_sql_query("SELECT date التاريخ, time الوقت, movement_type النوع, category البند, amount المبلغ, pay_method الوسيلة, method_details 'تفاصيل الحساب' FROM treasury ORDER BY id DESC LIMIT 100", conn), use_container_width=True)
+            st.dataframe(sql_df("SELECT date التاريخ, time الوقت, movement_type النوع, category البند, amount المبلغ, pay_method الوسيلة, method_details 'تفاصيل الحساب' FROM treasury ORDER BY id DESC LIMIT 100", conn), use_container_width=True)
 
         with t_day:
             day = st.date_input("اختر التاريخ", datetime.now()).strftime("%Y-%m-%d")
             parts = [
-                pd.read_sql_query("SELECT time الوقت,'مبيعات' النوع,client الطرف,total المبلغ FROM sales WHERE date=? AND is_return=0", conn, params=(day,)),
-                pd.read_sql_query("SELECT time الوقت,'مشتريات' النوع,supplier الطرف,total المبلغ FROM purchases WHERE date=?", conn, params=(day,)),
-                pd.read_sql_query("SELECT time الوقت,'خزينة ('||movement_type||')' النوع,category الطرف,amount المبلغ FROM treasury WHERE date=?", conn, params=(day,)),
+                sql_df("SELECT time الوقت,'مبيعات' النوع,client الطرف,total المبلغ FROM sales WHERE date=? AND is_return=0", conn, params=(day,)),
+                sql_df("SELECT time الوقت,'مشتريات' النوع,supplier الطرف,total المبلغ FROM purchases WHERE date=?", conn, params=(day,)),
+                sql_df("SELECT time الوقت,'خزينة ('||movement_type||')' النوع,category الطرف,amount المبلغ FROM treasury WHERE date=?", conn, params=(day,)),
             ]
             df_day = pd.concat(parts, ignore_index=True)
             if df_day.empty: st.info("لا توجد حركات في هذا اليوم.")
@@ -588,8 +734,8 @@ elif choice == "📑 التقارير وكشوف الحسابات":
             day_in = conn.execute("SELECT COALESCE(SUM(amount),0) FROM treasury WHERE date=? AND movement_type='إيداع'", (sel_date,)).fetchone()[0]
             day_out = conn.execute("SELECT COALESCE(SUM(amount),0) FROM treasury WHERE date=? AND movement_type='سحب'", (sel_date,)).fetchone()[0]
             
-            new_clients = pd.read_sql_query("SELECT DISTINCT client FROM sales WHERE date=? AND client NOT IN (SELECT DISTINCT client FROM sales WHERE date < ?)", conn, params=(sel_date, sel_date))
-            hot_leads = pd.read_sql_query("SELECT name, phone, status, notes FROM leads WHERE status IN ('تفاوض', 'إرسال عينة')", conn)
+            new_clients = sql_df("SELECT DISTINCT client FROM sales WHERE date=? AND client NOT IN (SELECT DISTINCT client FROM sales WHERE date < ?)", conn, params=(sel_date, sel_date))
+            hot_leads = sql_df("SELECT name, phone, status, notes FROM leads WHERE status IN ('تفاوض', 'إرسال عينة')", conn)
             
             d1, d2, d3, d4 = st.columns(4)
             lux_box(d1, "مبيعات بضاعة", f"{day_sales:,.2f} ج.م")
@@ -621,15 +767,15 @@ elif choice == "📑 التقارير وكشوف الحسابات":
             lux_box(c3, "المصروفات النثرية", f"{fin['expenses']:,.2f}")
             lux_box(c4, "صافي الربح التقديري", f"{fin['net_profit']:,.2f}")
             if PLOTLY_AVAILABLE:
-                ds = pd.read_sql_query("SELECT date, SUM(total) AS sales FROM sales WHERE date>=? AND is_return=0 GROUP BY date", conn, params=(since,))
+                ds = sql_df("SELECT date, SUM(total) AS sales FROM sales WHERE date>=? AND is_return=0 GROUP BY date", conn, params=(since,))
                 if not ds.empty: st.plotly_chart(px.bar(ds, x="date", y="sales", title="تريند المبيعات اليومية", color_discrete_sequence=["#c19b62"]).update_layout(**plotly_layout()), use_container_width=True)
 
         with t_stmt:
-            custs = pd.read_sql_query("SELECT name, opening_balance FROM customers", conn)
+            custs = sql_df("SELECT name, opening_balance FROM customers", conn)
             if not custs.empty:
                 sel = st.selectbox("اختر العميل لطباعة كشف حسابه:", custs['name'].tolist())
                 info = custs[custs['name'] == sel].iloc[0]
-                moves = pd.read_sql_query("SELECT date, item, qty, total, paid, pay_method FROM sales WHERE client=? ORDER BY date, id", conn, params=(sel,))
+                moves = sql_df("SELECT date, item, qty, total, paid, pay_method FROM sales WHERE client=? ORDER BY date, id", conn, params=(sel,))
                 
                 run = float(info['opening_balance'])
                 rows = f"<tr><td>-</td><td>رصيد افتتاحي</td><td>-</td><td>{run:,.2f}</td><td>-</td><td><b>{run:,.2f}</b></td></tr>" if run else ""
@@ -652,7 +798,7 @@ elif choice == "🎯 لوحة المبيعات والمهام (CRM)":
                 conn.execute("INSERT INTO todos (task, created_at) VALUES (?,?)", (new_task, now_dt()[0]))
                 conn.commit(); st.rerun()
             
-            todos_df = pd.read_sql_query("SELECT * FROM todos WHERE is_done=0 ORDER BY id DESC", conn)
+            todos_df = sql_df("SELECT * FROM todos WHERE is_done=0 ORDER BY id DESC", conn)
             for _, row in todos_df.iterrows():
                 cc1, cc2 = st.columns([0.15, 0.85])
                 done = cc1.checkbox("", key=f"t_{row['id']}")
@@ -673,7 +819,7 @@ elif choice == "🎯 لوحة المبيعات والمهام (CRM)":
                     conn.execute("INSERT INTO leads (date, name, phone, status, source, notes) VALUES (?,?,?, 'جديد', ?, ?)", (now_dt()[0], n_name, n_phone, n_src, n_notes))
                     conn.commit(); st.rerun()
 
-            leads_df = pd.read_sql_query("SELECT * FROM leads", conn)
+            leads_df = sql_df("SELECT * FROM leads", conn)
             statuses = ["جديد", "جاري التواصل", "إرسال عينة", "تفاوض", "مغلق - فاز", "مغلق - خسر"]
             k_cols = st.columns(len(statuses))
             
@@ -702,7 +848,7 @@ elif choice == "عروض الأسعار والكتالوج":
         
         t_quote, t_menu = st.tabs(["📝 إصدار كوتيشن (Quotation)", "🎨 توليد المنيو للطباعة (A4)"])
         
-        inv_df = pd.read_sql_query("SELECT name, type, sell_price, wholesale_price, dist_price FROM inv WHERE sell_price>0", conn)
+        inv_df = sql_df("SELECT name, type, sell_price, wholesale_price, dist_price FROM inv WHERE sell_price>0", conn)
         def get_price(r):
             if tier_choice == "جملة" and r['wholesale_price'] > 0: return r['wholesale_price']
             if tier_choice == "موزعين" and r['dist_price'] > 0: return r['dist_price']
@@ -752,11 +898,11 @@ elif choice == "☕ كوبي كاب (Kobe Cup)":
         with t_inv:
             st.markdown("### 📦 مخزون التجزئة (كوبي كاب)")
             kc_types = "('مطحون', 'محمص', 'كوبي كاب')"
-            df_kc_inv = pd.read_sql_query(f"SELECT name الصنف, type النوع, qty الكمية, sell_price السعر FROM inv WHERE type IN {kc_types} AND qty > 0", conn)
+            df_kc_inv = sql_df(f"SELECT name الصنف, type النوع, qty الكمية, sell_price السعر FROM inv WHERE type IN {kc_types} AND qty > 0", conn)
             st.dataframe(df_kc_inv, use_container_width=True)
 
             st.markdown("### 🔄 نقل بضاعة من مخزن الجملة للتجزئة")
-            src_inv = pd.read_sql_query(f"SELECT name, type, qty, buy_price FROM inv WHERE type NOT IN {kc_types} AND qty > 0", conn)
+            src_inv = sql_df(f"SELECT name, type, qty, buy_price FROM inv WHERE type NOT IN {kc_types} AND qty > 0", conn)
             if not src_inv.empty:
                 c1, c2 = st.columns(2)
                 options_src = [f"{r['name']} | {r['type']}" for _, r in src_inv.iterrows()]
@@ -782,7 +928,7 @@ elif choice == "☕ كوبي كاب (Kobe Cup)":
             st.markdown("### 🌐 التجارة الإلكترونية (أمازون، نون، والمتاجر)")
             ec1, ec2, ec3 = st.tabs(["📤 نقل بضاعة للمنصات", "💰 تسجيل مبيعات المنصات", "⚙️ إدارة المنصات"])
             with ec3:
-                plats = pd.read_sql_query("SELECT name FROM platforms", conn)
+                plats = sql_df("SELECT name FROM platforms", conn)
                 st.info("المنصات الحالية: " + "، ".join(plats['name'].tolist()))
                 new_plat = st.text_input("اسم المنصة الجديدة:")
                 if st.button("➕ إضافة منصة") and new_plat:
@@ -792,7 +938,7 @@ elif choice == "☕ كوبي كاب (Kobe Cup)":
                     except: st.error("موجودة مسبقاً.")
             with ec1:
                 plats_list = [r[0] for r in conn.execute("SELECT name FROM platforms").fetchall()]
-                inv_all = pd.read_sql_query("SELECT name, type, qty FROM inv WHERE qty > 0", conn)
+                inv_all = sql_df("SELECT name, type, qty FROM inv WHERE qty > 0", conn)
                 if plats_list and not inv_all.empty:
                     c1, c2 = st.columns(2)
                     p_sel = c1.selectbox("اختر المنصة:", plats_list)
@@ -804,9 +950,9 @@ elif choice == "☕ كوبي كاب (Kobe Cup)":
                         conn.execute("UPDATE inv SET qty=qty-? WHERE name=? AND type=?", (qx, in_, it_))
                         conn.execute("INSERT INTO ecommerce_inv (platform,item,type,qty) VALUES (?,?,?,?) ON CONFLICT(platform,item,type) DO UPDATE SET qty=qty+?", (p_sel, in_, it_, qx, qx))
                         conn.commit(); st.success("تم التوجيه!"); st.rerun()
-                st.dataframe(pd.read_sql_query("SELECT platform المنصة, item الصنف, type النوع, qty الكمية FROM ecommerce_inv WHERE qty > 0 ORDER BY platform", conn), use_container_width=True)
+                st.dataframe(sql_df("SELECT platform المنصة, item الصنف, type النوع, qty الكمية FROM ecommerce_inv WHERE qty > 0 ORDER BY platform", conn), use_container_width=True)
             with ec2:
-                ei = pd.read_sql_query("SELECT platform, item, type, qty FROM ecommerce_inv WHERE qty > 0", conn)
+                ei = sql_df("SELECT platform, item, type, qty FROM ecommerce_inv WHERE qty > 0", conn)
                 if not ei.empty:
                     c1, c2 = st.columns(2)
                     pl_sel = c1.selectbox("المنصة:", ei['platform'].unique())
@@ -823,7 +969,7 @@ elif choice == "☕ كوبي كاب (Kobe Cup)":
                         conn.execute("INSERT INTO ecommerce_sales (date, platform, item, qty, gross_price, fees, net_profit) VALUES (?,?,?,?,?,?,?)", (d, pl_sel, it_n, s_qty, gross_p, fees, net_p))
                         insert_treasury(conn, "إيداع", "مبيعات أونلاين", f"مبيعات {pl_sel}", net_p, "تحويل بنكي", "---")
                         conn.commit(); st.success("تم تسجيل الإيراد بصافي الربح!"); st.rerun()
-                st.dataframe(pd.read_sql_query("SELECT date التاريخ, platform المنصة, item الصنف, qty الكمية, gross_price الإجمالي, fees العمولة, net_profit الصافي FROM ecommerce_sales ORDER BY id DESC LIMIT 50", conn), use_container_width=True)
+                st.dataframe(sql_df("SELECT date التاريخ, platform المنصة, item الصنف, qty الكمية, gross_price الإجمالي, fees العمولة, net_profit الصافي FROM ecommerce_sales ORDER BY id DESC LIMIT 50", conn), use_container_width=True)
 
         with t_cust:
             c1, c2 = st.columns(2)
@@ -834,11 +980,11 @@ elif choice == "☕ كوبي كاب (Kobe Cup)":
                     conn.execute("INSERT INTO kc_customers (name,phone) VALUES (?,?)", (nc_name, nc_phone))
                     conn.commit(); st.success("تم!")
                 except: st.error("مسجل مسبقاً.")
-            st.dataframe(pd.read_sql_query("SELECT name as 'اسم العميل', phone as 'رقم الهاتف' FROM kc_customers ORDER BY id DESC", conn), use_container_width=True)
+            st.dataframe(sql_df("SELECT name as 'اسم العميل', phone as 'رقم الهاتف' FROM kc_customers ORDER BY id DESC", conn), use_container_width=True)
 
         with t_pos:
             kc_clients = [r[0] for r in conn.execute("SELECT name FROM kc_customers").fetchall()]
-            items = pd.read_sql_query("SELECT name, type, qty, sell_price FROM inv", conn)
+            items = sql_df("SELECT name, type, qty, sell_price FROM inv", conn)
             
             cl, cr = st.columns([1, 1.2])
             with cl:
@@ -884,7 +1030,7 @@ elif choice == "☕ كوبي كاب (Kobe Cup)":
 elif choice == "🔥 غرفة التحميص":
     st.markdown("## 🔥 غرفة التحميص وحساب الهدر والتكلفة")
     with get_conn() as conn:
-        greens = pd.read_sql_query("SELECT name, qty, buy_price, sell_price FROM inv WHERE type='أخضر'", conn)
+        greens = sql_df("SELECT name, qty, buy_price, sell_price FROM inv WHERE type='أخضر'", conn)
         if greens.empty:
             st.warning("لا يوجد بن أخضر مسجل.")
         else:
@@ -912,7 +1058,7 @@ elif choice == "📱 التسويق بالواتساب":
     st.markdown("## 📱 حملات التسويق بالواتساب (WhatsApp Marketing)")
     with get_conn() as conn:
         q = "SELECT name, phone FROM customers WHERE phone != '' UNION SELECT name, phone FROM kc_customers WHERE phone != '' UNION SELECT name, phone FROM leads WHERE phone != ''"
-        tg = pd.read_sql_query(q, conn).to_dict("records")
+        tg = sql_df(q, conn).to_dict("records")
     
     st.info(f"يوجد عدد **{len(tg)}** عميل مسجل بأرقام هواتف في النظام (جملة + تجزئة + محتملين).")
     msg = st.text_area("نص الحملة أو العرض الترويجي:", "عروض حصرية من كوبي جرين ☕\n\nاطلب الآن...", height=150)
@@ -940,13 +1086,13 @@ elif choice == "🛠️ الإعدادات والتعديل اليدوي":
                 conn.commit(); st.success("تم الحفظ!"); st.rerun()
         with t2:
             st.info("حدد أسعار القطاعي، الجملة، والموزعين لكل صنف بدقة.")
-            ed_i = st.data_editor(pd.read_sql_query("SELECT id, name, type, qty, sell_price, wholesale_price, dist_price FROM inv", conn), disabled=["id", "name", "type", "qty"], use_container_width=True)
+            ed_i = st.data_editor(sql_df("SELECT id, name, type, qty, sell_price, wholesale_price, dist_price FROM inv", conn), disabled=["id", "name", "type", "qty"], use_container_width=True)
             if st.button("💾 حفظ أسعار الشرائح"):
                 for _, r in ed_i.iterrows(): conn.execute("UPDATE inv SET sell_price=?, wholesale_price=?, dist_price=? WHERE id=?", (r['sell_price'], r['wholesale_price'], r['dist_price'], r['id']))
                 conn.commit(); st.success("تم التحديث!"); st.rerun()
         with t3:
             st.info("حدد الحد الأقصى للديون (Credit Limit) لكل عميل وشريحة التسعير الخاصة به.")
-            ed_c = st.data_editor(pd.read_sql_query("SELECT id, name, pricing_tier, credit_limit, opening_balance FROM customers", conn), column_config={"pricing_tier": st.column_config.SelectboxColumn("الشريحة", options=PRICING_TIERS)}, disabled=["id", "name"], use_container_width=True)
+            ed_c = st.data_editor(sql_df("SELECT id, name, pricing_tier, credit_limit, opening_balance FROM customers", conn), column_config={"pricing_tier": st.column_config.SelectboxColumn("الشريحة", options=PRICING_TIERS)}, disabled=["id", "name"], use_container_width=True)
             if st.button("💾 حفظ الائتمان والشرائح"):
                 for _, r in ed_c.iterrows(): conn.execute("UPDATE customers SET pricing_tier=?, credit_limit=?, opening_balance=? WHERE id=?", (r['pricing_tier'], r['credit_limit'], r['opening_balance'], r['id']))
                 conn.commit(); st.success("تم التحديث!"); st.rerun()
@@ -972,7 +1118,7 @@ elif choice == "👑 لوحة تحكم المدير":
         
         with get_conn() as conn:
             # نجلب البيانات (حد أقصى 500 سطر لتفادي بطء المتصفح)
-            df = pd.read_sql_query(f"SELECT * FROM {table_name} ORDER BY id DESC LIMIT 500", conn)
+            df = sql_df(f"SELECT * FROM {table_name} ORDER BY id DESC LIMIT 500", conn)
             
             st.info("💡 يمكنك تعديل أي خلية مباشرة، أو تحديد صف والضغط على Delete لمسحه.")
             edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True, key=f"editor_{table_name}")
@@ -1018,7 +1164,7 @@ elif choice == "⚙️ المستخدمين":
         st.error("عفواً، هذه الصفحة متاحة لمدير النظام فقط.")
     else:
         with get_conn() as conn:
-            st.dataframe(pd.read_sql_query("SELECT id, username, role FROM users", conn), use_container_width=True)
+            st.dataframe(sql_df("SELECT id, username, role FROM users", conn), use_container_width=True)
             with st.expander("➕ إضافة مستخدم جديد"):
                 nu = st.text_input("اسم المستخدم")
                 npw = st.text_input("الرقم السري", type="password")

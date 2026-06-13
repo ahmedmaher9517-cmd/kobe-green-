@@ -207,8 +207,7 @@ def migrate_supabase_kobe(connection_url):
         """
         
         cur.execute(SCHEMA)
-        
-        # Insert default data if empty
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS company_id BIGINT")
         cur.execute("SELECT COUNT(*) FROM settings")
         if cur.fetchone()[0] == 0:
             cur.execute(
