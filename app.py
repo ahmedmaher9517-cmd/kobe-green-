@@ -9,6 +9,10 @@ import json
 import requests
 from datetime import datetime, timedelta
 
+# منع شاشة البريد الترحيبية على السيرفر (Streamlit Cloud)
+os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
+os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
+
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -286,29 +290,18 @@ def init_db():
         conn.commit()
     migrate_schema()
 
-try:
-    init_db()
-except Exception as e:
-    st.error(
-        f"⚠️ **خطأ في قاعدة البيانات:** {e}\n\n"
-        f"**حلول محلية:**\n"
-        f"1. شغّل `DIAGNOSE_LOCAL.bat` واقرأ `LOCAL_DIAG.txt`\n"
-        f"2. تأكد من الإنترنت واتصال Supabase\n"
-        f"3. تأكد من `.env` أو `.streamlit/secrets.toml`"
-    )
-    if st.button("إعادة المحاولة"):
-        st.cache_resource.clear()
-        st.rerun()
-    st.stop()
+    migrate_schema()
 
-if USE_SUPABASE and "_db_ok" not in st.session_state:
-    try:
+
+@st.cache_resource
+def bootstrap_app_db():
+    """Migration بعد تشغيل السيرفر — يمرّ health check على Cloud."""
+    init_db()
+    if USE_SUPABASE:
         with get_conn() as conn:
             conn.execute("SELECT 1")
-        st.session_state["_db_ok"] = True
-    except Exception as e:
-        st.error(f"❌ فشل الاتصال بـ Supabase: {e}")
-        st.stop()
+    return True
+
 
 # ==========================================
 # 1. الدوال المساعدة وتصميم الـ HTML
@@ -636,6 +629,18 @@ def lux_box(col, label, value, css=""): col.markdown(f'<div class="lux-metric {c
 # ==========================================
 # 3. دورة التشغيل الأساسية والواجهة
 # ==========================================
+try:
+    bootstrap_app_db()
+except Exception as e:
+    st.error(
+        f"⚠️ **خطأ في قاعدة البيانات:** {e}\n\n"
+        f"تأكد من `SUPABASE_DB_URL` في Streamlit Secrets ثم Reboot."
+    )
+    if st.button("إعادة المحاولة"):
+        st.cache_resource.clear()
+        st.rerun()
+    st.stop()
+
 apply_theme()
 
 if not st.session_state.logged_in:
