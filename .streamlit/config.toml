@@ -1,11 +1,14 @@
+# Streamlit Cloud — لا تغيّر address/port (المنصة تضبطها تلقائياً)
 [server]
-headless = false
-address = "127.0.0.1"
-port = 8501
+headless = true
 enableCORS = false
-enableXsrfProtection = true
+enableXsrfProtection = false
 
 [browser]
 gatherUsageStats = false
-serverAddress = "127.0.0.1"
-serverPort = 8501
+
+[runner]
+fastReruns = true
+
+[client]
+showErrorDetails = true
