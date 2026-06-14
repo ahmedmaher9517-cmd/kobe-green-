@@ -3,3 +3,6 @@ pandas
 plotly
 requests
 psycopg2-binary
+arabic-reshaper
+python-bidi
+reportlab
