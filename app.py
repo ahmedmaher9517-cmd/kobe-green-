@@ -14,7 +14,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 try:
-    st.set_page_config(page_title="KOBE GREEN ERP", page_icon="☕", layout="wide", initial_sidebar_state="expanded")
+    st.set_page_config(page_title="كوبي جرين ERP", page_icon="☕", layout="wide", initial_sidebar_state="expanded")
 except Exception:
     pass
 
@@ -48,6 +48,23 @@ def _load_env_file():
 
 _load_env_file()
 
+
+def _load_secrets_from_file():
+    """Fallback when st.secrets unavailable (common on some local setups)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".streamlit", "secrets.toml")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("SUPABASE_DB_URL") and "=" in line:
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return None
+
+
 try:
     if hasattr(st, "secrets") and "supabase" in st.secrets and "SUPABASE_DB_URL" in st.secrets["supabase"]:
         SUPABASE_DB_URL = st.secrets["supabase"]["SUPABASE_DB_URL"]
@@ -58,6 +75,8 @@ except Exception:
 
 if not SUPABASE_DB_URL:
     SUPABASE_DB_URL = os.environ.get("SUPABASE_DB_URL")
+if not SUPABASE_DB_URL:
+    SUPABASE_DB_URL = _load_secrets_from_file()
 
 def _is_streamlit_cloud():
     return os.path.isdir("/mount/src") or os.environ.get("STREAMLIT_RUNTIME_ENV") == "cloud"
@@ -96,7 +115,9 @@ if USE_SUPABASE:
         st.stop()
 
 DB_NAME = os.environ.get("KOBE_DB_PATH", "kobecup_master_erp_v7.db")
-DEFAULT_COMPANY = "كوبي جرين | KOBE GREEN"
+DEFAULT_COMPANY = "كوبي جرين"
+DEFAULT_ADDRESS = "25 شارع محمد علي وسط البلد"
+BRAND_EN = "KOBE GREEN"
 TAGLINE = "نظام تخطيط الموارد وإدارة الأعمال"
 FONT_URL = "https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;900&family=Tajawal:wght@400;500;700;800&display=swap"
 
@@ -133,30 +154,29 @@ def get_conn():
     return sqlite3.connect(DB_NAME, check_same_thread=False)
 
 def authenticate_user(username, password):
-    """
-    Secure login function that checks username and password against the users table.
-    Returns: (success: bool, user_data: dict or None, error_message: str)
-    """
+    """Verify credentials — supports hashed and legacy plain passwords."""
+    from kobe_vast.auth_security import verify_password
+
     try:
         with get_conn() as conn:
             cur = conn.cursor()
             cur.execute(
-                "SELECT username, role, company_id FROM users WHERE username = ? AND password = ?",
-                (username.strip(), password),
+                "SELECT username, password, role, company_id FROM users WHERE username = ?",
+                (username.strip(),),
             )
             row = cur.fetchone()
-
-            if row:
-                user_data = {
-                    "username": row[0],
-                    "role": row[1],
-                    "company_id": row[2] if len(row) > 2 else None,
-                }
-                return True, user_data, None
-            return False, None, "Invalid username or password"
-                
+            if not row:
+                return False, None, "اسم المستخدم أو كلمة المرور غير صحيحة"
+            if not verify_password(password, row[1]):
+                return False, None, "اسم المستخدم أو كلمة المرور غير صحيحة"
+            user_data = {
+                "username": row[0],
+                "role": row[2],
+                "company_id": row[3] if len(row) > 3 else None,
+            }
+            return True, user_data, None
     except Exception as e:
-        return False, None, f"Database error: {str(e)}"
+        return False, None, f"خطأ في قاعدة البيانات: {e}"
 
 def migrate_schema():
     if USE_SUPABASE:
@@ -166,7 +186,11 @@ def migrate_schema():
         cols = [r[1] for r in conn.execute("PRAGMA table_info(leads)").fetchall()]
         if cols and "source" not in cols:
             conn.execute("ALTER TABLE leads ADD COLUMN source TEXT")
-            conn.commit()
+        conn.execute(
+            "UPDATE settings SET address=? WHERE id=1 AND (address IS NULL OR address='' OR address=?)",
+            (DEFAULT_ADDRESS, "مصر — القاهرة"),
+        )
+        conn.commit()
 
 
 @st.cache_resource
@@ -174,6 +198,12 @@ def _ensure_supabase_schema(db_url):
     """Run once per server — not on every Streamlit rerun."""
     from auto_migrate_kobe import migrate_supabase_kobe
     migrate_supabase_kobe(db_url)
+    try:
+        with get_conn() as conn:
+            from kobe_vast.db_ensure import ensure_all_late_tables
+            ensure_all_late_tables(conn)
+    except Exception:
+        pass
     return True
 
 
@@ -203,8 +233,50 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS ecommerce_inv (id INTEGER PRIMARY KEY AUTOINCREMENT, platform TEXT, item TEXT, type TEXT, qty REAL DEFAULT 0, UNIQUE(platform, item, type))")
         c.execute("CREATE TABLE IF NOT EXISTS ecommerce_sales (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, platform TEXT, item TEXT, qty REAL, gross_price REAL, fees REAL, net_profit REAL)")
         c.execute("CREATE TABLE IF NOT EXISTS todos (id INTEGER PRIMARY KEY AUTOINCREMENT, task TEXT, is_done INTEGER DEFAULT 0, created_at TEXT)")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS api_partners (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                partner_name TEXT NOT NULL,
+                partner_type TEXT DEFAULT 'متعاون',
+                api_key_hash TEXT NOT NULL,
+                api_key_prefix TEXT NOT NULL,
+                is_active INTEGER DEFAULT 1,
+                created_at TEXT,
+                revoked_at TEXT,
+                last_used_at TEXT,
+                notes TEXT DEFAULT '',
+                webhook_url TEXT DEFAULT ''
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS shipping_companies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                brand TEXT NOT NULL DEFAULT 'green',
+                phone TEXT DEFAULT '',
+                contact_name TEXT DEFAULT '',
+                notes TEXT DEFAULT '',
+                is_active INTEGER DEFAULT 1,
+                UNIQUE(name, brand)
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS shipping_cod (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                inv_no TEXT DEFAULT '',
+                client TEXT DEFAULT '',
+                cod_amount REAL DEFAULT 0,
+                shipping_fee REAL DEFAULT 0,
+                net_due REAL DEFAULT 0,
+                status TEXT DEFAULT 'pending',
+                settled_date TEXT,
+                notes TEXT DEFAULT ''
+            )
+        """)
 
-        c.execute("INSERT OR IGNORE INTO settings (id, company_name, phone, address) VALUES (1,?,?,?)", (DEFAULT_COMPANY, "01027766055", "مصر — القاهرة"))
+        c.execute("INSERT OR IGNORE INTO settings (id, company_name, phone, address) VALUES (1,?,?,?)", (DEFAULT_COMPANY, "01027766055", DEFAULT_ADDRESS))
         c.execute("INSERT OR IGNORE INTO users (username, password, role) VALUES ('admin', '123', 'مدير')")
         c.execute("INSERT OR IGNORE INTO platforms (name) VALUES ('أمازون (FBA)'), ('نون (FBN)'), ('المتجر الإلكتروني')")
         
@@ -217,7 +289,16 @@ def init_db():
 try:
     init_db()
 except Exception as e:
-    st.error(f"⚠️ خطأ في قاعدة البيانات: {e}")
+    st.error(
+        f"⚠️ **خطأ في قاعدة البيانات:** {e}\n\n"
+        f"**حلول محلية:**\n"
+        f"1. شغّل `DIAGNOSE_LOCAL.bat` واقرأ `LOCAL_DIAG.txt`\n"
+        f"2. تأكد من الإنترنت واتصال Supabase\n"
+        f"3. تأكد من `.env` أو `.streamlit/secrets.toml`"
+    )
+    if st.button("إعادة المحاولة"):
+        st.cache_resource.clear()
+        st.rerun()
     st.stop()
 
 if USE_SUPABASE and "_db_ok" not in st.session_state:
@@ -237,13 +318,16 @@ def _load_settings():
     with get_conn() as conn:
         row = conn.execute("SELECT company_name, phone, address, gemini_key FROM settings WHERE id=1").fetchone()
     if row:
+        addr = row[2] or ""
+        if not addr.strip() or addr.strip() == "مصر — القاهرة":
+            addr = DEFAULT_ADDRESS
         return {
             "company_name": row[0] or DEFAULT_COMPANY,
             "phone": row[1] or "",
-            "address": row[2] or "",
+            "address": addr,
             "gemini_key": row[3] or "",
         }
-    return {"company_name": DEFAULT_COMPANY, "phone": "", "address": "", "gemini_key": ""}
+    return {"company_name": DEFAULT_COMPANY, "phone": "", "address": DEFAULT_ADDRESS, "gemini_key": ""}
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -276,30 +360,134 @@ def plotly_layout():
     return dict(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(family="Cairo", color="#e8d5b5"), legend=dict(font=dict(color="#e8d5b5")), xaxis=dict(gridcolor="rgba(193,155,98,0.15)", tickfont=dict(color="#e8d5b5")), yaxis=dict(gridcolor="rgba(193,155,98,0.15)", tickfont=dict(color="#e8d5b5")))
 
 def wrap_capture_document(inner_html, file_base, a4=False):
+    from kobe_vast.arabic_text import INVOICE_AR_CSS
+
     a4_css = "width: 800px !important; min-width: 800px !important; max-width: 800px !important; margin: 0 auto; background-color: #fff; padding: 20px; box-sizing: border-box;"
-    if a4: a4_css = "width: 210mm !important; min-height: 297mm !important; margin: 0 auto !important; background: #fff !important; padding: 12mm !important; box-sizing: border-box !important;"
+    if a4:
+        a4_css = "width: 210mm !important; min-height: 297mm !important; margin: 0 auto !important; background: #fff !important; padding: 12mm !important; box-sizing: border-box !important;"
     fb = file_base.replace("\\", "\\\\").replace("'", "\\'")
-    return f"""<!DOCTYPE html><html dir="rtl" lang="ar"><head><meta charset="utf-8"><link href="{FONT_URL}" rel="stylesheet"><script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script><script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script><style>body{{margin:0;padding:16px;font-family:'Cairo',sans-serif;background:#f0ebe3;direction:rtl;}}[data-html2canvas-ignore]{{text-align:center;margin-bottom:16px;padding:12px;background:#143d2a;border-radius:12px;}}[data-html2canvas-ignore] button{{font-family:'Cairo',sans-serif;font-weight:700;padding:10px 20px;margin:5px;border-radius:8px;cursor:pointer;background:#c19b62;color:#143d2a;border:none;}}#capture-area{{ {a4_css} }}</style></head><body><div data-html2canvas-ignore><button onclick="downloadJPG()">حفظ JPG</button><button onclick="downloadPDF()">حفظ PDF</button></div><div style="overflow-x:auto;"><div id="capture-area">{inner_html}</div></div><script>const FILE_BASE = '{fb}';async function captureCanvas() {{const el = document.getElementById('capture-area');return await html2canvas(el, {{scale: 2, windowWidth: { '793' if a4 else '800' }, useCORS: true}});}}async function downloadJPG() {{const canvas = await captureCanvas();const link = document.createElement('a');link.download = FILE_BASE + '.jpg';link.href = canvas.toDataURL('image/jpeg', 0.95);link.click();}}async function downloadPDF() {{const canvas = await captureCanvas();const img = canvas.toDataURL('image/jpeg', 0.95);const {{jsPDF}} = window.jspdf;const pdf = new jsPDF('p','mm','a4');const pw = pdf.internal.pageSize.getWidth();const ph = pdf.internal.pageSize.getHeight();const ratio = Math.min(pw/canvas.width, ph/canvas.height);pdf.addImage(img,'JPEG',(pw-canvas.width*ratio)/2,10,canvas.width*ratio,canvas.height*ratio);pdf.save(FILE_BASE + '.pdf');}}</script></body></html>"""
+    return f"""<!DOCTYPE html><html dir="rtl" lang="ar"><head><meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="{FONT_URL}" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <style>
+    body{{margin:0;padding:16px;font-family:'Cairo','Tajawal',sans-serif;background:#f0ebe3;direction:rtl;}}
+    #capture-area,.ar{{font-family:'Cairo','Tajawal',sans-serif!important;}}
+    {INVOICE_AR_CSS}
+    [data-html2canvas-ignore]{{text-align:center;margin-bottom:16px;padding:14px;background:#143d2a;border-radius:12px;}}
+    [data-html2canvas-ignore] button{{font-family:'Cairo',sans-serif;font-weight:700;padding:12px 24px;margin:6px;
+    border-radius:8px;cursor:pointer;background:#c19b62;color:#143d2a;border:none;font-size:16px;}}
+    #capture-area{{ {a4_css} }}
+    </style></head><body>
+    <div data-html2canvas-ignore>
+    <button onclick="downloadPDF()">📄 تحميل PDF</button>
+    <button onclick="downloadJPG()">🖼️ تحميل JPG</button>
+    </div>
+    <div style="overflow-x:auto;"><div id="capture-area">{inner_html}</div></div>
+    <script>
+    const FILE_BASE = '{fb}';
+    async function waitFonts() {{
+        if (document.fonts && document.fonts.ready) await document.fonts.ready;
+        await new Promise(r => setTimeout(r, 800));
+    }}
+    async function captureCanvas() {{
+        await waitFonts();
+        const el = document.getElementById('capture-area');
+        return await html2canvas(el, {{
+            scale: 2, useCORS: true, letterRendering: true,
+            windowWidth: { '793' if a4 else '800' },
+            onclone: function(doc) {{
+                doc.querySelectorAll('.ar').forEach(function(n) {{
+                    n.style.fontFamily = "Cairo, Tajawal, sans-serif";
+                    n.style.direction = "rtl";
+                    n.style.unicodeBidi = "embed";
+                    n.style.textAlign = "right";
+                }});
+            }}
+        }});
+    }}
+    async function downloadJPG() {{
+        const canvas = await captureCanvas();
+        const link = document.createElement('a');
+        link.download = FILE_BASE + '.jpg';
+        link.href = canvas.toDataURL('image/jpeg', 0.95);
+        link.click();
+    }}
+    async function downloadPDF() {{
+        const canvas = await captureCanvas();
+        const img = canvas.toDataURL('image/jpeg', 0.95);
+        const {{jsPDF}} = window.jspdf;
+        const pdf = new jsPDF('p','mm','a4');
+        const pw = pdf.internal.pageSize.getWidth();
+        const ph = pdf.internal.pageSize.getHeight();
+        const ratio = Math.min(pw/canvas.width, ph/canvas.height);
+        pdf.addImage(img,'JPEG',(pw-canvas.width*ratio)/2,10,canvas.width*ratio,canvas.height*ratio);
+        pdf.save(FILE_BASE + '.pdf');
+    }}
+    </script></body></html>"""
+
+
+def show_invoice_capture(res, cfg, file_base, brand="green"):
+    """معاينة فاتورة + PDF/صورة بنفس الشكل (html2canvas)."""
+    from kobe_vast.invoice_export import wrap_invoice_document
+
+    cfg = dict(cfg or {})
+    if not (cfg.get("address") or "").strip():
+        cfg["address"] = DEFAULT_ADDRESS
+
+    html = (
+        build_kobecup_invoice_html(res, cfg)
+        if brand == "kobecup"
+        else build_invoice_html(res, cfg)
+    )
+    components.html(
+        wrap_invoice_document(html, file_base, FONT_URL),
+        height=820,
+        scrolling=True,
+    )
+
 
 def show_capture_component(inner_html, file_base, a4=False):
     components.html(wrap_capture_document(inner_html, file_base, a4), height=900, scrolling=True)
 
-def load_logo_html():
+def load_logo_html(show_title=False):
     if os.path.exists("logo.png"):
-        with open("logo.png", "rb") as f: b64 = base64.b64encode(f.read()).decode()
-        return f'<img src="data:image/png;base64,{b64}" style="max-height:80px; display:block; margin: 0 auto;">'
-    return f'<div style="text-align:center; color:#c19b62; font-weight:bold; font-size:24px;">{DEFAULT_COMPANY}</div>'
+        with open("logo.png", "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        img = f'<img src="data:image/png;base64,{b64}" style="max-height:72px;display:block;margin:0 auto;">'
+        if show_title:
+            return f'{img}<div style="text-align:center;color:#c19b62;font-weight:700;font-size:18px;margin-top:6px;">{DEFAULT_COMPANY}</div>'
+        return img
+    if show_title:
+        return f'<div style="text-align:center;color:#c19b62;font-weight:900;font-size:26px;">{DEFAULT_COMPANY}</div>'
+    return ""
 
 def build_invoice_html(res, cfg):
-    rows = "".join(f"<tr><td style='padding:15px 10px; border-bottom:1px solid #eee; text-align:right;'><b>{i['item']}</b><br><span style='font-size:12px;color:#777;'>النوع: {i.get('type', '-')}</span></td><td style='padding:15px 10px; border-bottom:1px solid #eee;text-align:center;'>{i['qty']:,.2f}</td><td style='padding:15px 10px; border-bottom:1px solid #eee;text-align:center;'>{i['p']:,.2f}</td><td style='padding:15px 10px; border-bottom:1px solid #eee; font-weight:900; color:#143d2a;text-align:center;'>{i['t']:,.2f}</td></tr>" for i in res["cart"])
-    return f"""<style>@import url('{FONT_URL}');.inv-container {{ width: 100%; margin: 0 auto; font-family: 'Cairo', 'Tajawal', sans-serif; background: #fff; padding: 40px; border: 1px solid #e0e0e0; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.08); direction: rtl; color: #333; }}.inv-header {{ display: flex; justify-content: space-between; border-bottom: 4px solid #143d2a; padding-bottom: 20px; margin-bottom: 30px; align-items: flex-start; }}.inv-company-info {{ text-align: right; flex: 1; }}.inv-company-info h2 {{ color: #143d2a; margin: 10px 0 5px 0; font-family: 'Tajawal', sans-serif; font-weight: 900; font-size: 28px; }}.inv-company-info p {{ margin: 4px 0; color: #555; font-size: 14px; }}.inv-details {{ text-align: left; flex: 1; }}.inv-details h1 {{ color: #c19b62; font-size: 42px; margin: 0 0 10px 0; font-family: 'Tajawal', sans-serif; text-transform: uppercase; letter-spacing: 2px; line-height: 1; }}.inv-details p {{ margin: 5px 0; font-size: 15px; color: #444; font-weight: 600; }}.inv-bill-to {{ background: #f9fbf9; border-right: 5px solid #143d2a; padding: 20px; border-radius: 8px; margin-bottom: 30px; border: 1px solid #eee; }}.inv-bill-to h4 {{ margin: 0 0 8px 0; color: #777; font-size: 14px; font-weight: 600; }}.inv-bill-to h3 {{ margin: 0; color: #143d2a; font-size: 22px; font-weight: 900; }}.inv-table {{ width: 100%; border-collapse: collapse; margin-bottom: 30px; }}.inv-table th {{ background: #143d2a; color: #c19b62; padding: 15px 10px; font-weight: 900; border-bottom: 3px solid #c19b62; text-align: center; font-size: 16px; }}.inv-table th:first-child {{ text-align: right; }}.inv-table td {{ text-align: center; font-size: 15px; }}.inv-summary {{ display: flex; justify-content: flex-end; }}.inv-summary-box {{ width: 380px; background: #fcfaf5; border: 1px solid #e8e0d0; border-radius: 8px; padding: 20px; }}.inv-row {{ display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px dashed #e8e0d0; font-size: 15px; color: #555; font-weight: 600; }}.inv-row.net {{ font-size: 22px; font-weight: 900; color: #143d2a; border-bottom: 2px solid #c19b62; padding-bottom: 15px; margin-bottom: 5px; }}.inv-row.paid {{ color: #2e7d32; font-weight: 800; }}.inv-row.rem {{ border: none; font-size: 18px; font-weight: 900; color: #d32f2f; padding-top: 15px; }}.inv-footer {{ text-align: center; margin-top: 40px; padding-top: 20px; border-top: 1px solid #eee; color: #888; font-size: 14px; font-weight: 700; }}</style>\n<div class="inv-container"><div class="inv-header"><div class="inv-company-info"><div style="text-align: right;">{load_logo_html().replace('margin: 0 auto', 'margin: 0')}</div><h2>{cfg['company_name']}</h2><p><b>📍 العنوان:</b> {cfg['address']}</p><p><b>📞 الهاتف:</b> {cfg['phone']}</p></div><div class="inv-details"><h1>فاتورة</h1><p>INVOICE #{res['no']}</p><p><b>تاريخ الإصدار:</b> {res['d']}</p></div></div><div class="inv-bill-to"><h4>فاتورة إلى السادة:</h4><h3>{res['c']}</h3><div style="margin-top: 12px; font-size: 15px; color: #444;"><b>طريقة الدفع:</b> {res['pay']}</div></div><table class="inv-table"><thead><tr><th style="width: 40%;">الصنف والبيان</th><th style="width: 20%;">الكمية</th><th style="width: 20%;">سعر الوحدة</th><th style="width: 20%;">الإجمالي</th></tr></thead><tbody>{rows}</tbody></table><div class="inv-summary"><div class="inv-summary-box"><div class="inv-row"><span>الإجمالي الفرعي:</span><span>{res['gross']:,.2f} ج.م</span></div><div class="inv-row" style="color: #d32f2f;"><span>الخصم:</span><span>- {res['disc']:,.2f} ج.م</span></div><div class="inv-row net"><span>الصافي المستحق:</span><span>{res['net']:,.2f} ج.م</span></div><div class="inv-row paid"><span>المبلغ المدفوع:</span><span>{res['paid']:,.2f} ج.م</span></div><div class="inv-row rem"><span>الرصيد المتبقي:</span><span>{res['rem']:,.2f} ج.م</span></div></div></div><div class="inv-footer">شكراً لثقتكم في {cfg['company_name']} 🌱</div></div>"""
+    from kobe_vast.invoice_html import build_green_invoice_html
+    return build_green_invoice_html(res, cfg, FONT_URL, load_logo_html, DEFAULT_COMPANY)
 
-def build_statement_html(client, rows_html, balance, stmt_date, cfg):
-    return f"""<style>@import url('{FONT_URL}');.st{{width:100%;font-family:'Cairo',sans-serif;}}.tbl{{width:100%;border-collapse:collapse;margin:20px 0;}}.tbl th{{background:#143d2a;color:#c19b62;padding:10px;border:1px solid #ccc;}}.tbl td{{text-align:center;padding:8px;border:1px solid #eee;}}</style>\n<div class="st"><div style="text-align:center;border-bottom:3px solid #143d2a;padding-bottom:15px;">{load_logo_html()}<h2>كشف حساب تفصيلي</h2></div><div style="display:flex;justify-content:space-between;margin:20px 0;background:#f9f9f9;padding:15px;"><div><b>العميل:</b> {client}</div><div><b>التاريخ:</b> {stmt_date}</div></div><table class="tbl"><thead><tr><th>التاريخ</th><th>البيان</th><th>الكمية</th><th>مدين (عليه)</th><th>دائن (سدد)</th><th>الرصيد</th></tr></thead><tbody>{rows_html}</tbody></table><div style="text-align:center;background:#143d2a;color:#fff;padding:15px;font-size:20px;border-radius:8px;font-weight:bold;">الرصيد النهائي المستحق: {balance:,.2f} ج.م</div></div>"""
 
 def build_kobecup_invoice_html(res, cfg):
-    rows = "".join(f"<tr><td style='padding:12px 10px;border-bottom:1px solid #eee;text-align:right;'><b>{i['item']}</b><br><span style='font-size:12px;color:#777;'>النوع: {i.get('type', '-')}</span></td><td style='padding:15px 10px;border-bottom:1px solid #eee;text-align:center;'>{i['qty']:,.2f}</td><td style='padding:15px 10px;border-bottom:1px solid #eee;text-align:center;'>{i['p']:,.2f}</td><td style='padding:15px 10px;border-bottom:1px solid #eee;font-weight:bold;color:#e85d04;text-align:center;'>{i['t']:,.2f}</td></tr>" for i in res["cart"])
-    return f"""<style>@import url('{FONT_URL}');.inv{{width:100%;font-family:'Cairo',sans-serif;color:#333;background:#fff;padding:40px;border:1px solid #e0e0e0;border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,0.08);direction:rtl;}}.tbl{{width:100%;border-collapse:collapse;margin:30px 0;}}.tbl th{{background:#e85d04;color:#fff;padding:15px 10px;text-align:center;}}.tbl th:first-child{{text-align:right;}}.tbl td{{text-align:center;}}.sum-box{{float:left;width:350px;background:#fffaf5;padding:20px;border:1px solid #fbdba7;border-radius:8px;}}.r{{display:flex;justify-content:space-between;margin-bottom:10px;font-weight:600;color:#555;}}</style>\n<div class="inv"><div style="display:flex;justify-content:space-between;border-bottom:4px solid #e85d04;padding-bottom:20px;"><div><h1 style="color:#e85d04;margin:0;font-size:40px;">KOBE CUP</h1><p><b>الهاتف:</b> {cfg['phone']}</p></div><div style="text-align:left;"><h2>إيصال مبيعات التجزئة</h2><b>رقم:</b> #{res['no']}<br><b>التاريخ:</b> {res['d']}<br><br><div style="background:#fff5eb;padding:10px;border-right:4px solid #e85d04;"><b>العميل:</b> {res['c']}<br><b>الدفع:</b> {res['pay']}</div></div></div>\n<table class="tbl"><thead><tr><th style="width:40%;">الصنف والبيان</th><th>الكمية</th><th>السعر</th><th>الإجمالي</th></tr></thead><tbody>{rows}</tbody></table>\n<div class="sum-box"><div class="r"><span>الإجمالي:</span><span>{res['gross']:,.2f} ج.م</span></div><div class="r" style="color:red;"><span>الخصم:</span><span>{res['disc']:,.2f} ج.م</span></div><div class="r" style="font-weight:900;font-size:22px;color:#e85d04;border-bottom:2px solid #e85d04;padding-bottom:10px;margin-bottom:10px;"><span>الصافي:</span><span>{res['net']:,.2f} ج.م</span></div></div><div style="clear:both;"></div><div style="text-align:center;margin-top:40px;padding-top:20px;border-top:1px solid #eee;color:#e85d04;font-weight:bold;font-size:16px;">شكراً لتسوقكم من كوبي كاب ☕🟧</div></div>"""
+    from kobe_vast.invoice_html import build_kc_invoice_html
+    return build_kc_invoice_html(res, cfg, FONT_URL)
+
+def build_statement_html(client, rows_html, balance, stmt_date, cfg):
+    from kobe_vast.arabic_text import INVOICE_AR_CSS, ar_html
+    return f"""<style>@import url('{FONT_URL}');{INVOICE_AR_CSS}.st{{width:100%;font-family:'Cairo',sans-serif;direction:rtl;}}.tbl{{width:100%;border-collapse:collapse;margin:20px 0;}}.tbl th{{background:#143d2a;color:#c19b62;padding:10px;border:1px solid #ccc;}}.tbl td{{text-align:center;padding:8px;border:1px solid #eee;}}</style>
+<div class="st"><div style="text-align:center;border-bottom:3px solid #143d2a;padding-bottom:15px;">{load_logo_html()}<h2 class="ar">{ar_html('كشف حساب تفصيلي')}</h2></div>
+<div style="display:flex;justify-content:space-between;margin:20px 0;background:#f9f9f9;padding:15px;">
+<div class="ar"><b>{ar_html('العميل:')}</b> {ar_html(client)}</div>
+<div class="ar"><b>{ar_html('التاريخ:')}</b> {ar_html(stmt_date)}</div></div>
+<table class="tbl"><thead><tr>
+<th class="ar">{ar_html('التاريخ')}</th><th class="ar">{ar_html('البيان')}</th>
+<th class="ar">{ar_html('الكمية')}</th><th class="ar">{ar_html('مدين (عليه)')}</th>
+<th class="ar">{ar_html('دائن (سدد)')}</th><th class="ar">{ar_html('الرصيد')}</th>
+</tr></thead><tbody>{rows_html}</tbody></table>
+<div class="ar" style="text-align:center;background:#143d2a;color:#fff;padding:15px;font-size:20px;border-radius:8px;font-weight:bold;">
+{ar_html('الرصيد النهائي المستحق:')} {balance:,.2f} {ar_html('ج.م')}</div></div>"""
 
 def build_quote_html(cname, rows_html, exp, qdate, cfg, brand="green"):
     mc = "#143d2a" if brand == "green" else "#e85d04"
@@ -428,6 +616,11 @@ def ai_copilot_parser(cmd, api_key=""):
     return msg
 
 def apply_theme():
+    try:
+        from kobe_vast.mobile_ui import inject_mobile_css
+        inject_mobile_css()
+    except Exception:
+        pass
     st.markdown(f"""<style>@import url('{FONT_URL}'); html, body, [class*="css"] {{ font-family: 'Cairo', sans-serif !important; }}
     .stApp {{ background: #0a110d; color: #ece6da; }}
     .main-header {{ background: linear-gradient(145deg, #1a5238, #143d2a); padding: 20px; border-radius: 15px; text-align: center; border: 1px solid #c19b62; margin-bottom: 20px; box-shadow: 0 5px 15px rgba(0,0,0,0.3);}}
@@ -448,12 +641,14 @@ apply_theme()
 if not st.session_state.logged_in:
     _, mid, _ = st.columns([1, 2, 1])
     with mid:
-        st.markdown(f'<div class="main-header">{load_logo_html()}<br><h2>تسجيل الدخول</h2></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="main-header">{load_logo_html(show_title=True)}<h2>تسجيل الدخول</h2></div>', unsafe_allow_html=True)
         with st.form("login"):
             u = st.text_input("اسم المستخدم", placeholder="أدخل اسم المستخدم")
-            p = st.text_input("كلمة المرور", type="password", placeholder="أدخل كلمة المرور")
+            p = st.text_input("كلمة المرور", type="password", placeholder="8 أحرف على الأقل")
+            from kobe_vast.auth_security import password_strength_hint
+            st.caption(password_strength_hint())
             
-            if st.form_submit_button("دخول", use_container_width=True):
+            if st.form_submit_button("دخول آمن", use_container_width=True):
                 if not u.strip() or not p:
                     st.error("⚠️ يرجى إدخال اسم المستخدم وكلمة المرور")
                 else:
@@ -481,34 +676,152 @@ cfg = get_settings()
 st.sidebar.markdown(f"👤 **{st.session_state.username}** | {st.session_state.role}")
 if USE_SUPABASE:
     st.sidebar.success("🟢 Supabase — بيانات دائمة")
+    try:
+        with get_conn() as _kc:
+            _pending = _kc.execute(
+                "SELECT COUNT(*) FROM kds_orders WHERE status IN ('pending','preparing')"
+            ).fetchone()[0]
+        if int(_pending or 0) > 0:
+            st.sidebar.warning(f"🍳 KDS: {_pending} طلب معلّق")
+    except Exception:
+        pass
 else:
     st.sidebar.error("🔴 SQLite — للتجربة فقط")
 if st.sidebar.button("🚪 تسجيل الخروج", key="btn_logout_master"): st.session_state.logged_in = False; st.rerun()
 st.sidebar.markdown("---")
 
-st.sidebar.markdown("### 🤖 المساعد الذكي (Gemini Analyst)")
-ai_cmd = st.sidebar.chat_input("اطلب تحليل، بيع، أو اسأل (بالصوت أو الكتابة)")
-if ai_cmd:
-    with st.spinner("جاري التفكير والتحليل..."):
-        ai_response = ai_copilot_parser(ai_cmd, cfg.get("gemini_key", ""))
-        st.sidebar.success(ai_response)
+def _gemini_context(conn):
+    try:
+        items_df = sql_df("SELECT name, type, qty, sell_price FROM inv", conn)
+        df_t = sql_df("SELECT movement_type, amount FROM treasury", conn)
+        cash = (
+            df_t[df_t["movement_type"] == "إيداع"]["amount"].sum()
+            - df_t[df_t["movement_type"] == "سحب"]["amount"].sum()
+            if not df_t.empty
+            else 0
+        )
+        today = now_dt()[0]
+        s_today = float(
+            conn.execute(
+                "SELECT COALESCE(SUM(total),0) FROM sales WHERE date=? AND is_return=0",
+                (today,),
+            ).fetchone()[0]
+            or 0
+        )
+        low = sql_df("SELECT name, qty FROM inv WHERE qty<=10", conn).to_dict("records")
+        return {
+            "cash_balance": float(cash),
+            "sales_today": s_today,
+            "low_stock": low[:10],
+            "products": items_df.head(30).to_dict("records"),
+            "cart_items": len(st.session_state.get("cart", [])),
+        }
+    except Exception:
+        return {}
+
+
+def _build_gemini_handlers(conn):
+    def execute_sale(data):
+        cur = conn.cursor()
+        items_df = sql_df("SELECT name, type, qty, sell_price FROM inv", conn)
+        qty = float(data.get("qty", 0))
+        price = float(data.get("price", 0) or 0)
+        item_name = data.get("item", "")
+        item_type = data.get("type", "أخضر")
+        client = data.get("client", "عميل نقدي (AI)")
+        if price == 0 and not items_df.empty:
+            m = items_df[(items_df["name"] == item_name) & (items_df["type"] == item_type)]
+            if m.empty:
+                m = items_df[items_df["name"].str.contains(item_name, na=False)]
+            if not m.empty:
+                price = float(m.iloc[0]["sell_price"] or 0)
+                item_type = str(m.iloc[0]["type"])
+        total = qty * price
+        d, t = now_dt()
+        inv_no = f"AI-{datetime.now().strftime('%M%S')}"
+        cur.execute(
+            "INSERT INTO sales (date, time, inv_no, client, item, type, qty, unit_p, total, paid, discount, is_return, pay_method, shipping_method) VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?,'---')",
+            (d, t, inv_no, client, item_name, item_type, qty, price, total, total, 0, "كاش"),
+        )
+        cur.execute("UPDATE inv SET qty = qty - ? WHERE name=? AND type=?", (qty, item_name, item_type))
+        insert_treasury(conn, "إيداع", "مبيعات (AI)", f"فاتورة {inv_no}", total, "كاش", "---")
+        conn.commit()
+        return f"✅ تم تسجيل بيع {qty} {item_name} بـ {total:,.2f} ج.م."
+
+    def execute_payment(data):
+        amt = float(data.get("amount", 0))
+        client = data.get("client", "عميل")
+        conn.execute(
+            "INSERT INTO sales (date, time, inv_no, client, item, type, qty, unit_p, total, paid, discount, is_return, pay_method, shipping_method) VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?,'---')",
+            (now_dt()[0], now_dt()[1], f"AI-REC-{datetime.now().strftime('%M%S')}", client, "سداد دفعة (AI)", "-", 0, 0, 0, amt, 0, "كاش"),
+        )
+        insert_treasury(conn, "إيداع", "تحصيل ديون", f"سداد من {client}", amt, "كاش", "---")
+        conn.commit()
+        return f"✅ تم تحصيل {amt:,.2f} ج.م من {client}."
+
+    def execute_report(data):
+        msg = data.get("message", "")
+        today = now_dt()[0]
+        wf = weekly_financials(conn, today)
+        ctx = _gemini_context(conn)
+        return (
+            f"🤖 {msg}\n"
+            f"مبيعات اليوم: {ctx.get('sales_today', 0):,.2f} ج.م | "
+            f"السيولة: {ctx.get('cash_balance', 0):,.2f} ج.م | "
+            f"صافي الأسبوع: {wf['net_profit']:,.2f} ج.م"
+        )
+
+    def add_to_cart(data):
+        qty = float(data.get("qty", 1))
+        price = float(data.get("price", 0) or 0)
+        item_name = data.get("item", "")
+        item_type = data.get("type", "أخضر")
+        if price == 0:
+            items_df = sql_df("SELECT name, type, sell_price FROM inv", conn)
+            m = items_df[(items_df["name"] == item_name)]
+            if not m.empty:
+                price = float(m.iloc[0]["sell_price"] or 0)
+                item_type = str(m.iloc[0]["type"])
+        st.session_state.setdefault("cart", []).append(
+            {"item": item_name, "type": item_type, "qty": qty, "p": price, "t": qty * price}
+        )
+        return f"✅ أضفت {qty} كجم {item_name} للسلة — افتح المبيعات لإصدار الفاتورة"
+
+    return {
+        "context": _gemini_context(conn),
+        "execute_sale": execute_sale,
+        "execute_payment": execute_payment,
+        "execute_report": execute_report,
+        "add_to_cart": add_to_cart,
+    }
+
+
+try:
+    from kobe_vast.gemini_assistant import render_gemini_sidebar
+
+    with st.sidebar.expander("🤖 المساعد الذكي", expanded=False):
+        with get_conn() as _gconn:
+            render_gemini_sidebar(cfg, _build_gemini_handlers(_gconn))
+except Exception as _ge:
+    st.sidebar.caption(f"المساعد: {_ge}")
 st.sidebar.markdown("---")
 
-MENU = [
-    "🏠 الرئيسية (الداشبورد)", "🛒 المبيعات والمشتريات", "📦 إدارة المخزون", 
-    "🏦 الخزينة واليومية", "📑 التقارير وكشوف الحسابات", "🎯 لوحة المبيعات والمهام (CRM)", 
-    "عروض الأسعار والكتالوج", "☕ كوبي كاب (Kobe Cup)", "🔥 غرفة التحميص", "📱 التسويق بالواتساب", 
-    "🛠️ الإعدادات والتعديل اليدوي", "👑 لوحة تحكم المدير"
-]
-choice = st.sidebar.radio("القائمة الرئيسية:", MENU)
-st.markdown(f'<div class="main-header">{load_logo_html()}<h3 style="color:#c19b62;margin:5px 0;">{DEFAULT_COMPANY}</h3><span style="color:#a89a82">{TAGLINE}</span></div>', unsafe_allow_html=True)
+from kobe_vast.nav_menu import render_nav
+
+page = render_nav(st.session_state.role)
+
+st.markdown(
+    f'<div class="main-header">{load_logo_html(show_title=True)}'
+    f'<span style="color:#a89a82;font-size:14px;">{TAGLINE}</span></div>',
+    unsafe_allow_html=True,
+)
 banks_list = get_banks()
 
 # ==========================================
 # الصفحات البرمجية
 # ==========================================
 
-if choice == "🏠 الرئيسية (الداشبورد)":
+if page == "home":
     st.markdown("## 📊 نظرة عامة على البيزنس")
     with get_conn() as conn:
         s_today = conn.execute("SELECT SUM(total) FROM sales WHERE date=? AND is_return=0", (now_dt()[0],)).fetchone()[0] or 0
@@ -522,70 +835,51 @@ if choice == "🏠 الرئيسية (الداشبورد)":
         lux_box(c3, "تكلفة المخزون الحالي", f"{inv_val:,.2f} ج.م")
         lux_box(c4, "عدد الفواتير اليوم", f"{conn.execute('SELECT COUNT(*) FROM sales WHERE date=?', (now_dt()[0],)).fetchone()[0]}")
 
-elif choice == "🛒 المبيعات والمشتريات":
+elif page == "invoices":
+    with get_conn() as conn:
+        try:
+            from kobe_vast.invoice_registry import render_invoice_history
+            render_invoice_history(
+                conn, sql_df, show_invoice_capture,
+                build_invoice_html, build_kobecup_invoice_html, get_settings,
+                key_prefix="inv_main",
+            )
+        except Exception as e:
+            st.error(f"خطأ سجل الفواتير: {e}")
+
+elif page == "sales":
     st.markdown("## 🛒 إدارة المبيعات والمشتريات")
-    t_sale, t_buy, t_ret = st.tabs(["🛒 نقطة البيع (إصدار فاتورة)", "📥 إدخال مشتريات للمخزن", "🔙 المرتجعات"])
-    
+    t_sale, t_hist, t_buy, t_ret = st.tabs([
+        "🛒 نقطة البيع (إصدار فاتورة)", "📋 سجل الفواتير",
+        "📥 إدخال مشتريات للمخزن", "🔙 المرتجعات",
+    ])
+
     with t_sale:
         c_df = _load_customers_df()
         items = _load_inv_df()
-        
-        cl, cr = st.columns([1, 1.2])
-        with cl:
-            client = st.selectbox("العميل", ["عميل نقدي"] + c_df['name'].tolist() + ["+ عميل جديد"])
-            c_tier, c_limit = "قطاعي", 10000.0
-            if client == "+ عميل جديد":
-                client = st.text_input("اسم العميل الجديد")
-            elif client != "عميل نقدي":
-                c_info = c_df[c_df['name'] == client].iloc[0]
-                c_tier, c_limit = c_info['pricing_tier'], float(c_info['credit_limit'])
-                with get_conn() as conn: st.info(f"شريحة العميل: **{c_tier}** | الديون الحالية: **{client_debt(conn, client):,.2f}**")
+        with get_conn() as conn:
+            try:
+                from kobe_vast.pos_sales import render_pos_sale_tab
+                render_pos_sale_tab(
+                    conn, sql_df, items, c_df, banks_list,
+                    now_dt, client_debt, insert_treasury,
+                    show_invoice_capture, build_invoice_html, get_settings,
+                    PAY_METHODS, _load_inv_df.clear, _load_customers_df.clear,
+                )
+            except Exception as e:
+                st.error(f"خطأ نقطة البيع: {e}")
 
-            if not items.empty:
-                options = [f"{r['name']} | {r['type']}" for _, r in items.iterrows()]
-                sel = st.selectbox("الصنف", options)
-                idx = options.index(sel)
-                i_row = items.iloc[idx]
-                i_n, i_t = str(i_row['name']), str(i_row['type'])
-                
-                def_p = i_row['sell_price']
-                if c_tier == "جملة" and i_row['wholesale_price'] > 0: def_p = i_row['wholesale_price']
-                elif c_tier == "موزعين" and i_row['dist_price'] > 0: def_p = i_row['dist_price']
-                
-                qty = st.number_input("الكمية", 0.1, value=1.0)
-                up = st.number_input("السعر", 0.0, value=float(def_p))
-                if st.button("➕ إضافة للفاتورة"): st.session_state.cart.append({"item": i_n, "type": i_t, "qty": qty, "p": up, "t": qty*up}); st.rerun()
-                    
-            if st.session_state.cart:
-                st.dataframe(pd.DataFrame(st.session_state.cart), use_container_width=True)
-                if st.button("🗑️ مسح الكل"): st.session_state.cart = []; st.rerun()
-                
-                gross = sum(x["t"] for x in st.session_state.cart)
-                disc = st.number_input("خصم", 0.0, gross, 0.0)
-                net = gross - disc
-                paid = st.number_input("المدفوع", 0.0, value=float(net))
-                pm = st.selectbox("الدفع", PAY_METHODS)
-                bank_ch = st.selectbox("إلى حساب:", banks_list) if pm in ["تحويل بنكي", "محفظة"] else "---"
-                
-                if st.button("✅ إصدار الفاتورة وتأكيد البيع"):
-                    d, tm = now_dt()
-                    inv_no = f"INV-{datetime.now().strftime('%M%S')}"
-                    cf = client or "عميل نقدي"
-                    with get_conn() as conn:
-                        if cf != "عميل نقدي": conn.execute("INSERT OR IGNORE INTO customers (name) VALUES (?)", (cf,))
-                        for i, ln in enumerate(st.session_state.cart):
-                            ld, lp = (disc, paid) if i == 0 else (0, 0)
-                            conn.execute("INSERT INTO sales (date,time,inv_no,client,item,type,qty,unit_p,total,paid,discount,pay_method,is_return) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0)", (d, tm, inv_no, cf, ln["item"], ln["type"], ln["qty"], ln["p"], ln["t"]-ld, lp, ld, pm))
-                            conn.execute("UPDATE inv SET qty=qty-? WHERE name=? AND type=?", (ln["qty"], ln["item"], ln["type"]))
-                        insert_treasury(conn, "إيداع", "مبيعات", f"فاتورة {inv_no}", paid, pm, bank_ch)
-                        conn.commit()
-                    _load_inv_df.clear()
-                    _load_customers_df.clear()
-                    st.session_state.inv_res = {"no": inv_no, "d": d, "c": cf, "cart": list(st.session_state.cart), "gross": gross, "disc": disc, "net": net, "paid": paid, "rem": net-paid, "pay": pm}
-                    st.session_state.cart = []; st.rerun()
-
-        with cr:
-            if "inv_res" in st.session_state: show_capture_component(build_invoice_html(st.session_state.inv_res, get_settings()), f"INV_{st.session_state.inv_res['no']}")
+    with t_hist:
+        with get_conn() as conn:
+            try:
+                from kobe_vast.invoice_registry import render_invoice_history
+                render_invoice_history(
+                    conn, sql_df, show_invoice_capture,
+                    build_invoice_html, build_kobecup_invoice_html, get_settings,
+                    key_prefix="inv_sales",
+                )
+            except Exception as e:
+                st.error(f"خطأ سجل الفواتير: {e}")
 
     with t_buy:
         with get_conn() as conn: supps = [r[0] for r in conn.execute("SELECT name FROM suppliers").fetchall()]
@@ -636,31 +930,37 @@ elif choice == "🛒 المبيعات والمشتريات":
                 st.success("تم تسجيل المرتجع وإعادة البضاعة للمخزن بنجاح!")
                 st.rerun()
 
-elif choice == "📦 إدارة المخزون":
-    st.markdown("## 📦 الجرد وحالة المخزون")
-    with get_conn() as conn:
-        t_stock, t_sales_track, t_purch_track = st.tabs(["📊 حالة المخزون الحالية", "📤 حركة المبيعات المنصرفة", "📥 حركة المشتريات الواردة"])
-        
-        with t_stock:
-            df = sql_df("SELECT name الصنف, type النوع, qty الكمية, buy_price 'تكلفة الشراء', sell_price 'سعر البيع' FROM inv ORDER BY type", conn)
-            if not df.empty:
-                st.warning(f"إجمالي قيمة المخزون الحالية (بالتكلفة): **{(df['الكمية'] * df['تكلفة الشراء']).sum():,.2f} ج.م**")
-                st.dataframe(df, use_container_width=True)
-                
-        with t_sales_track:
-            st.markdown("#### 📤 سجل البضاعة المباعة (المنصرف)")
-            df_s = sql_df("SELECT date 'التاريخ', time 'الوقت', inv_no 'رقم الفاتورة', client 'العميل', item 'الصنف', type 'النوع', qty 'الكمية', total 'الإجمالي' FROM sales WHERE is_return=0 AND item!='سداد دفعة نقدية' ORDER BY id DESC LIMIT 200", conn)
-            st.dataframe(df_s, use_container_width=True)
-            
-        with t_purch_track:
-            st.markdown("#### 📥 سجل البضاعة المشتراة (الوارد)")
-            df_p = sql_df("SELECT date 'التاريخ', time 'الوقت', supplier 'المورد', item 'الصنف', type 'النوع', qty 'الكمية', total 'الإجمالي' FROM purchases WHERE item!='سداد دفعة نقدية' AND supplier!='نقل داخلي لكوبي كاب' ORDER BY id DESC LIMIT 200", conn)
-            st.dataframe(df_p, use_container_width=True)
+        with st.expander("🔙 مرتجع فاتورة دفع مقسّم (كاش + بنكين)"):
+            try:
+                from kobe_vast.finance_split import render_split_returns_ui
+                with get_conn() as conn:
+                    render_split_returns_ui(conn, banks_list)
+            except Exception as e:
+                st.error(str(e))
 
-elif choice == "🏦 الخزينة واليومية":
-    st.markdown("## 🏦 الخزينة ودفتر اليومية")
-    t_trs, t_day = st.tabs(["💰 أرصدة الخزينة والبنوك", "📓 دفتر حركات اليوم"])
+elif page == "inventory":
     with get_conn() as conn:
+        try:
+            from kobe_vast.inventory_dashboard import render_inventory_page
+            render_inventory_page(conn, sql_df, lux_box)
+        except Exception as e:
+            st.error(f"خطأ المخزون: {e}")
+            st.markdown("## 📦 الجرد وحالة المخزون")
+            df = sql_df("SELECT name, type, qty, buy_price, sell_price FROM inv ORDER BY type", conn)
+            if not df.empty:
+                df = df.rename(columns={"name": "الصنف", "type": "النوع", "qty": "الكمية", "buy_price": "تكلفة الشراء", "sell_price": "سعر البيع"})
+                st.dataframe(df, use_container_width=True)
+
+elif page == "treasury":
+    st.markdown("## 🏦 الخزينة ودفتر اليومية")
+    t_trs, t_ship, t_day = st.tabs(["💰 أرصدة الخزينة والبنوك", "🚚 شركات الشحن", "📓 دفتر حركات اليوم"])
+    with get_conn() as conn:
+        with t_ship:
+            try:
+                from kobe_vast.shipping_finance import render_shipping_finance_page
+                render_shipping_finance_page(conn, sql_df, lux_box, now_dt, insert_treasury, banks_list)
+            except Exception as e:
+                st.error(f"خطأ متابعة الشحن: {e}")
         with t_trs:
             df_t = sql_df("SELECT movement_type, pay_method, method_details, amount FROM treasury", conn)
             
@@ -723,20 +1023,30 @@ elif choice == "🏦 الخزينة واليومية":
                         insert_treasury(conn, "سحب", "سداد ديون", f"سداد لـ {sel_s}", amt_s, pm_s, det_s)
                         conn.commit(); st.success("تم السداد بنجاح!"); st.rerun()
             
-            st.dataframe(sql_df("SELECT date التاريخ, time الوقت, movement_type النوع, category البند, amount المبلغ, pay_method الوسيلة, method_details 'تفاصيل الحساب' FROM treasury ORDER BY id DESC LIMIT 100", conn), use_container_width=True)
+            df_tr = sql_df(
+                "SELECT date, time, movement_type, category, amount, pay_method, method_details FROM treasury ORDER BY id DESC LIMIT 100",
+                conn,
+            )
+            if not df_tr.empty:
+                df_tr = df_tr.rename(columns={
+                    "date": "التاريخ", "time": "الوقت", "movement_type": "النوع",
+                    "category": "البند", "amount": "المبلغ", "pay_method": "الوسيلة",
+                    "method_details": "تفاصيل الحساب",
+                })
+            st.dataframe(df_tr, use_container_width=True)
 
         with t_day:
             day = st.date_input("اختر التاريخ", datetime.now()).strftime("%Y-%m-%d")
             parts = [
-                sql_df("SELECT time الوقت,'مبيعات' النوع,client الطرف,total المبلغ FROM sales WHERE date=? AND is_return=0", conn, params=(day,)),
-                sql_df("SELECT time الوقت,'مشتريات' النوع,supplier الطرف,total المبلغ FROM purchases WHERE date=?", conn, params=(day,)),
-                sql_df("SELECT time الوقت,'خزينة ('||movement_type||')' النوع,category الطرف,amount المبلغ FROM treasury WHERE date=?", conn, params=(day,)),
+                sql_df("SELECT time, client, total FROM sales WHERE date=? AND is_return=0", conn, params=(day,)).assign(النوع="مبيعات").rename(columns={"time": "الوقت", "client": "الطرف", "total": "المبلغ"}),
+                sql_df("SELECT time, supplier, total FROM purchases WHERE date=?", conn, params=(day,)).assign(النوع="مشتريات").rename(columns={"time": "الوقت", "supplier": "الطرف", "total": "المبلغ"}),
+                sql_df("SELECT time, movement_type, category, amount FROM treasury WHERE date=?", conn, params=(day,)).assign(النوع=lambda d: "خزينة (" + d["movement_type"] + ")").rename(columns={"time": "الوقت", "category": "الطرف", "amount": "المبلغ"}),
             ]
             df_day = pd.concat(parts, ignore_index=True)
             if df_day.empty: st.info("لا توجد حركات في هذا اليوم.")
             else: st.dataframe(df_day.sort_values(by="الوقت", ascending=False).reset_index(drop=True), use_container_width=True)
 
-elif choice == "📑 التقارير وكشوف الحسابات":
+elif page == "reports":
     st.markdown("## 📑 التقارير المالية وحسابات العملاء")
     t_daily, t_prof, t_stmt = st.tabs(["📅 تقرير إقفال اليوم", "📈 التقرير الأسبوعي للأرباح", "👥 كشوف حسابات العملاء"])
     with get_conn() as conn:
@@ -800,112 +1110,31 @@ elif choice == "📑 التقارير وكشوف الحسابات":
                 
                 show_capture_component(build_statement_html(sel, rows, run, now_dt()[0], get_settings()), f"STMT_{sel}")
 
-elif choice == "🎯 لوحة المبيعات والمهام (CRM)":
-    st.markdown("## 🎯 إدارة العملاء المحتملين ومهام العمل (CRM & To-Do)")
-    
-    col_todo, col_crm = st.columns([1, 2.5])
-    
-    with get_conn() as conn:
-        with col_todo:
-            st.markdown("### ✅ قائمة المهام (To-Do)")
-            new_task = st.text_input("مهمة جديدة (مثال: كلم كافيه فلان)")
-            if st.button("إضافة مهمة") and new_task:
-                conn.execute("INSERT INTO todos (task, created_at) VALUES (?,?)", (new_task, now_dt()[0]))
-                conn.commit(); st.rerun()
-            
-            todos_df = sql_df("SELECT * FROM todos WHERE is_done=0 ORDER BY id DESC", conn)
-            for _, row in todos_df.iterrows():
-                cc1, cc2 = st.columns([0.15, 0.85])
-                done = cc1.checkbox("", key=f"t_{row['id']}")
-                cc2.markdown(f"<span style='font-size:14px;color:#e8d5b5;'>{row['task']}</span>", unsafe_allow_html=True)
-                if done:
-                    conn.execute("UPDATE todos SET is_done=1 WHERE id=?", (row['id'],))
-                    conn.commit(); st.rerun()
+elif page == "tools":
+    from kobe_vast.advanced_tools import render_tools_page
+    render_tools_page(
+        st.session_state.role,
+        get_conn,
+        sql_df,
+        lux_box,
+        banks_list,
+        get_settings,
+        show_capture_component,
+        build_quote_html,
+        build_menu_html,
+        wa_phone,
+        now_dt,
+        PRICING_TIERS,
+    )
 
-        with col_crm:
-            st.markdown("### 📊 مسار المبيعات (Pipeline)")
-            with st.expander("➕ إضافة عميل محتمل جديد (Lead)"):
-                c1, c2 = st.columns(2)
-                n_name = c1.text_input("اسم الكافيه / العميل")
-                n_phone = c1.text_input("رقم الموبايل (للواتساب)")
-                n_src = c2.selectbox("مصدر العميل", ["فيسبوك", "إنستغرام", "توصية", "زيارة ميدانية", "واتساب", "أخرى"])
-                n_notes = c2.text_input("الطلبات أو الملاحظات المبدئية")
-                if st.button("💾 حفظ الكارت"):
-                    conn.execute("INSERT INTO leads (date, name, phone, status, source, notes) VALUES (?,?,?, 'جديد', ?, ?)", (now_dt()[0], n_name, n_phone, n_src, n_notes))
-                    conn.commit(); st.rerun()
-
-            leads_df = sql_df("SELECT * FROM leads", conn)
-            statuses = ["جديد", "جاري التواصل", "إرسال عينة", "تفاوض", "مغلق - فاز", "مغلق - خسر"]
-            k_cols = st.columns(len(statuses))
-            
-            for i, status in enumerate(statuses):
-                with k_cols[i]:
-                    st.markdown(f'<div style="text-align:center;font-weight:900;font-size:14px;color:#143d2a;background:#d4af6a;padding:5px;border-radius:4px;margin-bottom:10px;">{status}</div>', unsafe_allow_html=True)
-                    subset = leads_df[leads_df['status'] == status]
-                    for _, row in subset.iterrows():
-                        st.markdown(f'<div style="background:#143d2a;padding:10px;border-radius:6px;border-right:3px solid #d4af6a;margin-bottom:8px;"><h4 style="margin:0;color:#fff;font-size:14px;">{row["name"]}</h4><p style="margin:4px 0;color:#ccc;font-size:12px;">📞 {row["phone"]}</p></div>', unsafe_allow_html=True)
-                        with st.expander("تعديل", expanded=False):
-                            new_stat = st.selectbox("نقل إلى:", statuses, index=statuses.index(status), key=f"s_{row['id']}")
-                            add_note = st.text_input("ملاحظة:", key=f"n_{row['id']}")
-                            if st.button("حفظ", key=f"b_{row['id']}"):
-                                final_notes = f"{row['notes']} | {add_note}" if add_note else row['notes']
-                                conn.execute("UPDATE leads SET status=?, notes=? WHERE id=?", (new_stat, final_notes, row['id']))
-                                conn.commit(); st.rerun()
-
-elif choice == "عروض الأسعار والكتالوج":
-    st.markdown("## 📝 إصدار عروض الأسعار وقوائم المنتجات")
-    with get_conn() as conn:
-        st.markdown("### ⚙️ إعدادات العرض")
-        col1, col2 = st.columns(2)
-        b_choice = col1.radio("تخصيص الهوية (البراند):", ["كوبي جرين (جملة وتوريدات - زيتي)", "كوبي كاب (تجزئة - برتقالي)"])
-        brand_key = "green" if "جرين" in b_choice else "cup"
-        tier_choice = col2.selectbox("شريحة التسعير المطبقة على العرض:", PRICING_TIERS)
-        
-        t_quote, t_menu = st.tabs(["📝 إصدار كوتيشن (Quotation)", "🎨 توليد المنيو للطباعة (A4)"])
-        
-        inv_df = sql_df("SELECT name, type, sell_price, wholesale_price, dist_price FROM inv WHERE sell_price>0", conn)
-        def get_price(r):
-            if tier_choice == "جملة" and r['wholesale_price'] > 0: return r['wholesale_price']
-            if tier_choice == "موزعين" and r['dist_price'] > 0: return r['dist_price']
-            return r['sell_price']
-        inv_df['price'] = inv_df.apply(get_price, axis=1)
-        
-        with t_quote:
-            st.markdown("#### 📄 إنشاء عرض أسعار مخصص")
-            qcname = st.text_input("موجه إلى السادة:", "عزيزي العميل")
-            options_q = [f"{r['name']} | {r['type']}" for _, r in inv_df.iterrows()]
-            picked = st.multiselect("اختر الأصناف لعرض السعر:", options_q)
-            if picked:
-                qrows = ""
-                for p in picked:
-                    n, t = p.split(" | ")
-                    price = inv_df[(inv_df['name']==n) & (inv_df['type']==t)]['price'].values[0]
-                    qrows += f"<tr><td>{n} <br><span style='font-size:12px;color:#777;'>النوع: {t}</span></td><td style='font-size:18px;'>{price:,.2f} ج.م</td></tr>"
-                exp = (datetime.now() + timedelta(days=5)).strftime("%Y-%m-%d")
-                show_capture_component(build_quote_html(qcname, qrows, exp, now_dt()[0], get_settings(), brand=brand_key), f"Quote_{qcname}")
-
-        with t_menu:
-            st.markdown("#### 🎨 تصميم وتوليد القائمة (المنيو)")
-            c1, c2 = st.columns(2)
-            menu_title = c1.text_input("عنوان المنيو (اتركه فارغاً للإلغاء):", "KOBE GREEN" if brand_key=="green" else "KOBE CUP")
-            menu_sub = c2.text_input("النص الفرعي:", "قائمة أسعار التوريد والجملة" if brand_key=="green" else "أفخر أنواع القهوة المختصة - قطاع التجزئة")
-            
-            template_choice = st.selectbox(
-                "اختر قالب التصميم (A4):",
-                [1, 2, 3],
-                format_func=lambda x: {
-                    1: "1 — Classic Luxury (ذهبي مع هوية البراند)",
-                    2: "2 — Minimalist Executive (أبيض وداكن - للطباعة العادية)",
-                    3: "3 — Royal Emerald (زمردي ملكي - فخم جداً)",
-                }[x]
-            )
-            
-            all_prods = inv_df.to_dict('records')
-            if all_prods and st.button("🎨 توليد المنيو الآن"):
-                show_capture_component(build_menu_html(all_prods, get_settings(), template=template_choice, title=menu_title, subtitle=menu_sub, brand=brand_key), "Generated_Menu", a4=True)
-
-elif choice == "☕ كوبي كاب (Kobe Cup)":
-    st.markdown(f'<div style="background:linear-gradient(135deg, #f97316, #ea580c);padding:25px;border-radius:12px;color:#fff;text-align:center;margin-bottom:25px;box-shadow:0 10px 20px rgba(234, 88, 12, 0.2);"> <h1 style="margin:0;font-size:42px;font-weight:900;letter-spacing:2px;color:#fff;">☕ KOBE CUP</h1><p style="margin:10px 0 0 0;font-size:18px;opacity:0.9;">نظام إدارة التجزئة المنفصل (عملاء، فواتير، وتجارة إلكترونية)</p></div>', unsafe_allow_html=True)
+elif page == "kobecup":
+    st.markdown(
+        f'<div style="background:linear-gradient(135deg,#f97316,#ea580c);padding:20px;border-radius:12px;'
+        f'color:#fff;text-align:center;margin-bottom:20px;">'
+        f'<h2 style="margin:0;font-size:28px;font-weight:900;">🟧 كوبي كاب — التجزئة</h2>'
+        f'<p style="margin:6px 0 0;opacity:0.9;font-size:14px;">فواتير · مخزون · أونلاين · عملاء</p></div>',
+        unsafe_allow_html=True,
+    )
     
     with get_conn() as conn:
         t_pos, t_inv, t_ecom, t_cust = st.tabs(["🛒 كاشير التجزئة", "📦 مخزون ونقل داخلي", "🌐 التجارة الإلكترونية", "👥 عملاء التجزئة"])
@@ -913,7 +1142,9 @@ elif choice == "☕ كوبي كاب (Kobe Cup)":
         with t_inv:
             st.markdown("### 📦 مخزون التجزئة (كوبي كاب)")
             kc_types = "('مطحون', 'محمص', 'كوبي كاب')"
-            df_kc_inv = sql_df(f"SELECT name الصنف, type النوع, qty الكمية, sell_price السعر FROM inv WHERE type IN {kc_types} AND qty > 0", conn)
+            df_kc_inv = sql_df(f"SELECT name, type, qty, sell_price FROM inv WHERE type IN {kc_types} AND qty > 0", conn)
+            if not df_kc_inv.empty:
+                df_kc_inv = df_kc_inv.rename(columns={"name": "الصنف", "type": "النوع", "qty": "الكمية", "sell_price": "السعر"})
             st.dataframe(df_kc_inv, use_container_width=True)
 
             st.markdown("### 🔄 نقل بضاعة من مخزن الجملة للتجزئة")
@@ -965,7 +1196,10 @@ elif choice == "☕ كوبي كاب (Kobe Cup)":
                         conn.execute("UPDATE inv SET qty=qty-? WHERE name=? AND type=?", (qx, in_, it_))
                         conn.execute("INSERT INTO ecommerce_inv (platform,item,type,qty) VALUES (?,?,?,?) ON CONFLICT(platform,item,type) DO UPDATE SET qty=qty+?", (p_sel, in_, it_, qx, qx))
                         conn.commit(); st.success("تم التوجيه!"); st.rerun()
-                st.dataframe(sql_df("SELECT platform المنصة, item الصنف, type النوع, qty الكمية FROM ecommerce_inv WHERE qty > 0 ORDER BY platform", conn), use_container_width=True)
+                df_ec = sql_df("SELECT platform, item, type, qty FROM ecommerce_inv WHERE qty > 0 ORDER BY platform", conn)
+                if not df_ec.empty:
+                    df_ec = df_ec.rename(columns={"platform": "المنصة", "item": "الصنف", "type": "النوع", "qty": "الكمية"})
+                st.dataframe(df_ec, use_container_width=True)
             with ec2:
                 ei = sql_df("SELECT platform, item, type, qty FROM ecommerce_inv WHERE qty > 0", conn)
                 if not ei.empty:
@@ -984,7 +1218,16 @@ elif choice == "☕ كوبي كاب (Kobe Cup)":
                         conn.execute("INSERT INTO ecommerce_sales (date, platform, item, qty, gross_price, fees, net_profit) VALUES (?,?,?,?,?,?,?)", (d, pl_sel, it_n, s_qty, gross_p, fees, net_p))
                         insert_treasury(conn, "إيداع", "مبيعات أونلاين", f"مبيعات {pl_sel}", net_p, "تحويل بنكي", "---")
                         conn.commit(); st.success("تم تسجيل الإيراد بصافي الربح!"); st.rerun()
-                st.dataframe(sql_df("SELECT date التاريخ, platform المنصة, item الصنف, qty الكمية, gross_price الإجمالي, fees العمولة, net_profit الصافي FROM ecommerce_sales ORDER BY id DESC LIMIT 50", conn), use_container_width=True)
+                df_es = sql_df(
+                    "SELECT date, platform, item, qty, gross_price, fees, net_profit FROM ecommerce_sales ORDER BY id DESC LIMIT 50",
+                    conn,
+                )
+                if not df_es.empty:
+                    df_es = df_es.rename(columns={
+                        "date": "التاريخ", "platform": "المنصة", "item": "الصنف",
+                        "qty": "الكمية", "gross_price": "الإجمالي", "fees": "العمولة", "net_profit": "الصافي",
+                    })
+                st.dataframe(df_es, use_container_width=True)
 
         with t_cust:
             c1, c2 = st.columns(2)
@@ -995,106 +1238,119 @@ elif choice == "☕ كوبي كاب (Kobe Cup)":
                     conn.execute("INSERT INTO kc_customers (name,phone) VALUES (?,?)", (nc_name, nc_phone))
                     conn.commit(); st.success("تم!")
                 except: st.error("مسجل مسبقاً.")
-            st.dataframe(sql_df("SELECT name as 'اسم العميل', phone as 'رقم الهاتف' FROM kc_customers ORDER BY id DESC", conn), use_container_width=True)
+            df_kc = sql_df("SELECT name, phone FROM kc_customers ORDER BY id DESC", conn)
+            if not df_kc.empty:
+                df_kc = df_kc.rename(columns={"name": "اسم العميل", "phone": "رقم الهاتف"})
+            st.dataframe(df_kc, use_container_width=True)
 
         with t_pos:
+            from kobe_vast.mobile_ui import add_item_button
+            from kobe_vast.pos_sales import render_editable_cart
+
+            kc_types = "('مطحون', 'محمص', 'كوبي كاب')"
+            kc_items = sql_df(f"SELECT name, type, qty, sell_price FROM inv WHERE type IN {kc_types} AND qty > 0", conn)
             kc_clients = [r[0] for r in conn.execute("SELECT name FROM kc_customers").fetchall()]
-            items = sql_df("SELECT name, type, qty, sell_price FROM inv", conn)
-            
+
             cl, cr = st.columns([1, 1.2])
             with cl:
-                client = st.selectbox("اختر عميل كوبي كاب:", ["عميل نقدي (تجزئة)"] + kc_clients)
-                if not items.empty:
-                    options = [f"{r['name']} | {r['type']}" for _, r in items.iterrows()]
-                    sel = st.selectbox("الصنف:", options, key="kc_sel")
+                st.markdown("### 🟧 كاشير كوبي كاب")
+                client = st.selectbox("العميل", ["عميل نقدي (تجزئة)"] + kc_clients, key="kc_client")
+
+                st.markdown('<div class="add-item-box platform-card-kobecup">', unsafe_allow_html=True)
+                st.markdown("#### ➕ إضافة صنف للفاتورة")
+                if kc_items.empty:
+                    st.warning("لا يوجد مخزون تجزئة — انقل بضاعة من تبويب المخزون")
+                else:
+                    options = [f"{r['name']} | {r['type']} ({r['qty']:,.1f} كجم)" for _, r in kc_items.iterrows()]
+                    sel = st.selectbox("اختر الصنف", options, key="kc_sel")
                     idx = options.index(sel)
-                    i_row = items.iloc[idx]
-                    qty = st.number_input("الكمية", 0.1, value=1.0, key="kc_qty")
-                    up = st.number_input("السعر", 0.0, float(i_row['sell_price']), key="kc_price")
-                    if st.button("➕ إضافة للسلة (كوبي كاب)", key="kc_add"):
-                        st.session_state['kc_cart'].append({"item": str(i_row['name']), "type": str(i_row['type']), "qty": qty, "p": up, "t": qty*up})
+                    i_row = kc_items.iloc[idx]
+                    c1, c2, c3 = st.columns(3)
+                    qty = c1.number_input("الكمية", 0.1, value=1.0, key="kc_qty", step=0.1)
+                    up = c2.number_input("السعر", 0.0, float(i_row["sell_price"]), key="kc_price")
+                    c3.metric("السطر", f"{qty * up:,.2f} ج.م")
+                    if add_item_button(f"➕ أضف {i_row['name']}", key="kc_add"):
+                        st.session_state.setdefault("kc_cart", []).append({
+                            "item": str(i_row["name"]), "type": str(i_row["type"]),
+                            "qty": qty, "p": up, "t": round(qty * up, 2),
+                            "platform": "kobecup",
+                        })
                         st.rerun()
-                
-                if st.session_state.get('kc_cart'):
-                    st.dataframe(pd.DataFrame(st.session_state['kc_cart']).rename(columns={"item":"الصنف", "type":"النوع", "qty":"الكمية", "p":"السعر", "t":"الإجمالي"}), use_container_width=True)
-                    if st.button("🗑️ إفراغ السلة", key="kc_clr"): st.session_state['kc_cart'] = []; st.rerun()
-                    
-                    gross = sum(x["t"] for x in st.session_state['kc_cart'])
-                    disc = st.number_input("الخصم", 0.0, gross, 0.0, key="kc_disc")
+                st.markdown("</div>", unsafe_allow_html=True)
+
+                if st.session_state.get("kc_cart"):
+                    cart = render_editable_cart(st.session_state["kc_cart"], cart_key="kc")
+                    st.session_state["kc_cart"] = cart
+                    if not cart:
+                        st.session_state["kc_cart"] = []
+                        st.rerun()
+
+                    gross = sum(x["t"] for x in cart)
+                    c1, c2 = st.columns(2)
+                    disc = c1.number_input("الخصم", 0.0, gross, 0.0, key="kc_disc")
                     net = gross - disc
-                    paid = st.number_input("المبلغ المدفوع", 0.0, float(net), key="kc_paid")
+                    paid = c2.number_input("المدفوع", 0.0, float(net), key="kc_paid")
                     pm = st.selectbox("طريقة الدفع", PAY_METHODS, key="kc_pm")
                     bank_ch = st.selectbox("إلى حساب:", banks_list, key="kc_bank") if pm in ["تحويل بنكي", "محفظة"] else "---"
-                    
-                    if st.button("🟧 إصدار الفاتورة البرتقالية"):
+
+                    if st.button("🟧 إصدار فاتورة كوبي كاب", type="primary", use_container_width=True):
                         d, tm = now_dt()
-                        inv_no = f"KC-{datetime.now().strftime('%M%S')}"
-                        for i, ln in enumerate(st.session_state['kc_cart']):
+                        inv_no = f"KC-{datetime.now().strftime('%H%M%S')}"
+                        for i, ln in enumerate(cart):
                             ld, lp = (disc, paid) if i == 0 else (0, 0)
-                            conn.execute("INSERT INTO sales (date,time,inv_no,client,item,type,qty,unit_p,total,paid,discount,pay_method,is_return) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0)", (d, tm, inv_no, client, ln["item"], ln["type"], ln["qty"], ln["p"], ln["t"]-ld, lp, ld, pm))
+                            conn.execute(
+                                "INSERT INTO sales (date,time,inv_no,client,item,type,qty,unit_p,total,paid,discount,pay_method,is_return) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0)",
+                                (d, tm, inv_no, client, ln["item"], ln["type"], ln["qty"], ln["p"], ln["t"] - ld, lp, ld, pm),
+                            )
                             conn.execute("UPDATE inv SET qty=qty-? WHERE name=? AND type=?", (ln["qty"], ln["item"], ln["type"]))
-                        if paid > 0 and pm != "آجل": insert_treasury(conn, "إيداع", "مبيعات كوبي كاب", f"إيصال {inv_no}", paid, pm, bank_ch)
+                        if paid > 0 and pm != "آجل":
+                            insert_treasury(conn, "إيداع", "مبيعات كوبي كاب", f"إيصال {inv_no}", paid, pm, bank_ch)
                         conn.commit()
-                        st.session_state.kc_res = {"no": inv_no, "d": d, "c": client, "cart": list(st.session_state['kc_cart']), "gross": gross, "disc": disc, "net": net, "paid": paid, "pay": pm}
-                        st.session_state['kc_cart'] = []; st.rerun()
+                        st.session_state.kc_res = {
+                            "no": inv_no, "d": d, "c": client, "cart": list(cart),
+                            "gross": gross, "disc": disc, "net": net, "paid": paid,
+                            "rem": net - paid, "pay": pm,
+                        }
+                        st.session_state["kc_cart"] = []
+                        st.rerun()
 
             with cr:
                 if "kc_res" in st.session_state:
-                    show_capture_component(build_kobecup_invoice_html(st.session_state.kc_res, get_settings()), f"KobeCup_{st.session_state.kc_res['no']}")
+                    show_invoice_capture(
+                        st.session_state.kc_res, get_settings(),
+                        f"KobeCup_{st.session_state.kc_res['no']}", brand="kobecup",
+                    )
+                elif st.session_state.get("kc_cart"):
+                    st.info("👈 عدّل الأصناف ثم اضغط إصدار الفاتورة")
+                else:
+                    st.markdown(
+                        '<div style="background:linear-gradient(135deg,#fff7ed,#ffedd5);border:2px solid #fdba74;'
+                        'border-radius:14px;padding:40px;text-align:center;color:#9a3412;">'
+                        '<h2 style="margin:0;">🟧 كوبي كاب</h2>'
+                        '<p>أضف أصناف التجزئة من اليسار</p></div>',
+                        unsafe_allow_html=True,
+                    )
 
-elif choice == "🔥 غرفة التحميص":
-    st.markdown("## 🔥 غرفة التحميص وحساب الهدر والتكلفة")
-    with get_conn() as conn:
-        greens = sql_df("SELECT name, qty, buy_price, sell_price FROM inv WHERE type='أخضر'", conn)
-        if greens.empty:
-            st.warning("لا يوجد بن أخضر مسجل.")
-        else:
-            c1, c2 = st.columns(2)
-            gn = c1.selectbox("البن الأخضر المراد تحميصه:", greens['name'].tolist())
-            iw = c1.number_input("الوزن الداخل للمحمصة (كجم)", min_value=0.1, value=10.0)
-            loss = c1.number_input("نسبة الفاقد المتوقعة (الهدر) %", 0.0, 50.0, 15.0)
-            rn = c2.text_input("اسم الصنف المحمص الناتج:", value=f"{gn} محمص")
-            
-            g = greens[greens['name'] == gn].iloc[0]
-            nq = iw * (1 - loss / 100)
-            total_cost = iw * float(g['buy_price'])
-            rc = total_cost / nq if nq > 0 else 0
-            rs = rc * 1.3 
-            
-            c2.info(f"الصافي المتوقع: **{nq:,.2f} كجم** | التكلفة الجديدة للكيلو: **{rc:,.2f} ج.م**")
-            
-            if st.button("🔥 تأكيد التحميص وتحديث المخزن") and rn:
-                conn.execute("UPDATE inv SET qty=qty-? WHERE name=? AND type='أخضر'", (iw, gn))
-                conn.execute("INSERT INTO inv (name,type,qty,buy_price,sell_price) VALUES (?,'محمص',?,?,?) ON CONFLICT(name,type) DO UPDATE SET qty=qty+?,buy_price=?", (rn, nq, rc, rs, nq, rc))
-                conn.execute("INSERT INTO roasting_log (date, green_bean, roasted_bean, in_qty, loss_pct, net_qty, cost, sell_price) VALUES (?,?,?,?,?,?,?,?)", (now_dt()[0], gn, rn, iw, loss, nq, rc, rs))
-                conn.commit(); st.success("تم التحميص وتحديث الأرصدة بنجاح!"); st.rerun()
+elif page == "integrations":
+    if st.session_state.role != "مدير":
+        st.warning("صفحة الربط متاحة للمدير فقط")
+    else:
+        with get_conn() as conn:
+            try:
+                from kobe_vast.partners_api import render_partners_page
+                render_partners_page(conn, sql_df)
+            except Exception as e:
+                st.error(f"خطأ صفحة الربط: {e}")
 
-elif choice == "📱 التسويق بالواتساب":
-    st.markdown("## 📱 حملات التسويق بالواتساب (WhatsApp Marketing)")
-    with get_conn() as conn:
-        q = "SELECT name, phone FROM customers WHERE phone != '' UNION SELECT name, phone FROM kc_customers WHERE phone != '' UNION SELECT name, phone FROM leads WHERE phone != ''"
-        tg = sql_df(q, conn).to_dict("records")
-    
-    st.info(f"يوجد عدد **{len(tg)}** عميل مسجل بأرقام هواتف في النظام (جملة + تجزئة + محتملين).")
-    msg = st.text_area("نص الحملة أو العرض الترويجي:", "عروض حصرية من كوبي جرين ☕\n\nاطلب الآن...", height=150)
-    
-    if st.button("🔗 تجهيز روابط الإرسال") and tg:
-        cols = st.columns(4)
-        enc = urllib.parse.quote(msg)
-        for i, t in enumerate(tg):
-            with cols[i%4]:
-                phone = wa_phone(t['phone'])
-                st.markdown(f'<a href="https://wa.me/{phone}?text={enc}" target="_blank" style="background:#25D366;color:#fff;padding:10px;border-radius:8px;display:block;text-align:center;text-decoration:none;margin-bottom:10px;font-weight:bold;">💬 إرسال لـ {t["name"]}</a>', unsafe_allow_html=True)
-
-elif choice == "🛠️ الإعدادات والتعديل اليدوي":
-    st.markdown("## 🛠️ إعدادات النظام المتقدمة")
+elif page == "settings":
+    st.markdown("## ⚙️ الإعدادات")
     t1, t2, t3 = st.tabs(["الإعدادات و Gemini", "تعديل الأسعار والشرائح", "العملاء والائتمان"])
     with get_conn() as conn:
         with t1:
             sc = get_settings()
             cn = st.text_input("الشركة", sc["company_name"])
             ph = st.text_input("الهاتف", sc["phone"])
-            ad = st.text_input("العنوان", sc["address"])
+            ad = st.text_input("العنوان", sc["address"], placeholder=DEFAULT_ADDRESS)
             gk = st.text_input("Gemini API Key (مفتاح الذكاء الاصطناعي)", sc.get("gemini_key", ""), type="password")
             if st.button("💾 حفظ الإعدادات الأساسية"):
                 conn.execute("UPDATE settings SET company_name=?,phone=?,address=?,gemini_key=? WHERE id=1", (cn, ph, ad, gk))
@@ -1114,81 +1370,10 @@ elif choice == "🛠️ الإعدادات والتعديل اليدوي":
                 for _, r in ed_c.iterrows(): conn.execute("UPDATE customers SET pricing_tier=?, credit_limit=?, opening_balance=? WHERE id=?", (r['pricing_tier'], r['credit_limit'], r['opening_balance'], r['id']))
                 conn.commit(); st.success("تم التحديث!"); st.rerun()
 
-elif choice == "👑 لوحة تحكم المدير":
-    if st.session_state.role != "مدير":
-        st.error("⛔ عذراً، هذه الصفحة مخصصة لمدير النظام فقط.")
-    else:
-        st.markdown("## 👑 لوحة تحكم المدير (تعديل وحذف السجلات)")
-        st.warning("⚠️ تحذير: أي تعديل أو حذف هنا ينعكس مباشرة على قاعدة البيانات. يرجى توخي الحذر الشديد.")
-        
-        tables = {
-            "المخزون (inv)": "inv",
-            "العملاء (customers)": "customers",
-            "المبيعات (sales)": "sales",
-            "الخزينة (treasury)": "treasury",
-            "المشتريات (purchases)": "purchases",
-            "الموردين (suppliers)": "suppliers"
-        }
-        
-        table_label = st.selectbox("اختر الجدول المراد تعديله:", list(tables.keys()))
-        table_name = tables[table_label]
-        
-        with get_conn() as conn:
-            # نجلب البيانات (حد أقصى 500 سطر لتفادي بطء المتصفح)
-            df = sql_df(f"SELECT * FROM {table_name} ORDER BY id DESC LIMIT 500", conn)
-            
-            st.info("💡 يمكنك تعديل أي خلية مباشرة، أو تحديد صف والضغط على Delete لمسحه.")
-            edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True, key=f"editor_{table_name}")
-            
-            if st.button("💾 تأكيد وحفظ التعديلات في قاعدة البيانات"):
-                try:
-                    cur = conn.cursor()
-                    
-                    # 1. Update existing or Insert new rows
-                    for _, row in edited_df.iterrows():
-                        if pd.notna(row['id']):
-                            # Update existing record
-                            cols = [c for c in row.index if c != 'id']
-                            set_clause = ", ".join([f"{c}=?" for c in cols])
-                            vals = [None if pd.isna(row[c]) else row[c] for c in cols] + [row['id']]
-                            cur.execute(f"UPDATE {table_name} SET {set_clause} WHERE id=?", vals)
-                        else:
-                            # Insert new record (if added via the UI)
-                            cols = [c for c in row.index if c != 'id']
-                            col_names = ", ".join(cols)
-                            placeholders = ", ".join(["?"] * len(cols))
-                            vals = [None if pd.isna(row[c]) else row[c] for c in cols]
-                            cur.execute(f"INSERT INTO {table_name} ({col_names}) VALUES ({placeholders})", vals)
-                    
-                    # 2. Handle Deletions
-                    original_ids = set(df['id'].dropna().astype(int).tolist())
-                    edited_ids = set(edited_df['id'].dropna().astype(int).tolist())
-                    deleted_ids = original_ids - edited_ids
-                    
-                    if deleted_ids:
-                        for did in deleted_ids:
-                            cur.execute(f"DELETE FROM {table_name} WHERE id=?", (did,))
-                            
-                    conn.commit()
-                    st.success(f"✅ تم حفظ التعديلات على جدول {table_name} بنجاح!")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"❌ حدث خطأ أثناء الحفظ: {e}")
-
-elif choice == "⚙️ المستخدمين":
-    st.markdown("## ⚙️ إدارة المستخدمين والصلاحيات")
-    if st.session_state.role != "مدير":
-        st.error("عفواً، هذه الصفحة متاحة لمدير النظام فقط.")
-    else:
-        with get_conn() as conn:
-            st.dataframe(sql_df("SELECT id, username, role FROM users", conn), use_container_width=True)
-            with st.expander("➕ إضافة مستخدم جديد"):
-                nu = st.text_input("اسم المستخدم")
-                npw = st.text_input("الرقم السري", type="password")
-                nr = st.selectbox("الدور", ["مدير", "كاشير"])
-                if st.button("إضافة") and nu and npw:
-                    try:
-                        conn.execute("INSERT INTO users (username,password,role) VALUES (?,?,?)", (nu, npw, nr))
-                        conn.commit(); st.success("تم الإضافة!"); st.rerun()
-                    except:
-                        st.error("اسم المستخدم مسجل مسبقاً.")
+elif page == "kds":
+    with get_conn() as conn:
+        try:
+            from kobe_vast.kds_ticket import render_kds_ui
+            render_kds_ui(conn, sql_df, st.session_state.get("username", ""))
+        except Exception as e:
+            st.error(f"خطأ في KDS: {e}")
