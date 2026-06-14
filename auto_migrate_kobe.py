@@ -208,11 +208,37 @@ def migrate_supabase_kobe(connection_url):
         
         cur.execute(SCHEMA)
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS company_id BIGINT")
+
+        # VAST v2 in savepoint — failure won't abort base schema transaction
+        cur.execute("SAVEPOINT vast_v2")
+        try:
+            from kobe_vast.schema_v2 import migrate_schema_v2, seed_core_menu
+            migrate_schema_v2(cur)
+            seed_core_menu(cur)
+            cur.execute("RELEASE SAVEPOINT vast_v2")
+        except Exception as vast_err:
+            cur.execute("ROLLBACK TO SAVEPOINT vast_v2")
+            import warnings
+            warnings.warn(f"VAST schema v2 skipped: {vast_err}")
+
+        # Always ensure late tables (api_partners, shipping) even if v2 savepoint failed
+        try:
+            from kobe_vast.schema_v2 import migrate_late_schema
+            migrate_late_schema(cur)
+        except Exception as late_err:
+            import warnings
+            warnings.warn(f"Late schema skipped: {late_err}")
+
         cur.execute("SELECT COUNT(*) FROM settings")
         if cur.fetchone()[0] == 0:
             cur.execute(
                 "INSERT INTO settings (company_name, phone, address) VALUES (%s, %s, %s)",
-                ("كوبي جرين | KOBE GREEN", "01027766055", "مصر — القاهرة")
+                ("كوبي جرين | KOBE GREEN", "01027766055", "25 شارع محمد علي وسط البلد")
+            )
+        else:
+            cur.execute(
+                "UPDATE settings SET address=%s WHERE address IS NULL OR address='' OR address=%s",
+                ("25 شارع محمد علي وسط البلد", "مصر — القاهرة"),
             )
         
         cur.execute("SELECT COUNT(*) FROM users")
